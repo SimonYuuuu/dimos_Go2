@@ -1,0 +1,23 @@
+[Unit]
+Description=DimOS Go2 on-robot API agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dimos
+Group=dimos
+WorkingDirectory=/opt/dimos_Go2
+EnvironmentFile=/etc/dimos-go2/robot-agent.env
+ExecStart=/opt/dimos_Go2/start_robot_agent.sh
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/dimos_Go2/simulation_legacy/maps /opt/dimos_Go2/simulation_legacy/logs /opt/dimos_Go2/robot_data
+
+[Install]
+WantedBy=multi-user.target

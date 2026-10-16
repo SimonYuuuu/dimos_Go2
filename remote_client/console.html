@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DimOS · 仓库巡检调度台</title>
+  <style>
+    :root { color-scheme: light; --ink:#172923; --muted:#62736a; --line:#d9e2db; --paper:#f1f5f1; --card:#fff; --green:#176447; --amber:#a76113; --red:#a63b32; }
+    * { box-sizing:border-box }
+    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.45 Inter,system-ui,sans-serif }
+    header { display:flex; align-items:center; justify-content:space-between; padding:20px max(24px,calc((100vw - 1440px)/2)); background:#173d2e; color:#fff }
+    header h1 { margin:0; font-size:22px; letter-spacing:.02em }
+    header span { color:#bfd5c7; font-size:13px }
+    main { max-width:1440px; padding:22px 24px 48px; margin:auto }
+    .toolbar,.columns { display:grid; grid-template-columns: minmax(310px,.78fr) minmax(520px,1.5fr); gap:18px; align-items:start }
+    .stack { display:grid; gap:18px }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; box-shadow:0 3px 14px #183b2910 }
+    h2 { margin:0 0 14px; font-size:17px }
+    h3 { margin:17px 0 8px; font-size:14px }
+    .sub { margin:-6px 0 12px; color:var(--muted); font-size:13px }
+    label { display:block; margin:11px 0 5px; font-size:13px; font-weight:650 }
+    input,select,button { min-height:38px; border:1px solid #bac9bf; border-radius:7px; padding:8px 10px; font:inherit; background:#fff; color:var(--ink) }
+    input,select { width:100% }
+    button { cursor:pointer; font-weight:650; transition:.15s ease }
+    button:hover { filter:brightness(.96); transform:translateY(-1px) }
+    button.primary { border-color:var(--green); background:var(--green); color:white }
+    button.stop { background:var(--red); color:white; border-color:var(--red) }
+    button.secondary { background:#edf4ef }
+    button:disabled { opacity:.5; cursor:not-allowed; transform:none }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px }
+    .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px }
+    .notice { border-left:4px solid #d39a35; background:#fff7e8; padding:10px 12px; border-radius:4px; color:#684719; font-size:13px; margin:12px 0 }
+    .status { display:flex; align-items:center; gap:8px; padding:9px 11px; border-radius:7px; background:#edf4ef; margin:8px 0; font-size:13px }
+    .dot { width:9px; height:9px; border-radius:50%; background:#89978d; flex:none }
+    .dot.running { background:#18a566; box-shadow:0 0 0 4px #18a56620 }
+    .dot.error { background:#c34439 }
+    .map-wrap { position:relative }
+    #mapCanvas { display:block; width:100%; height:min(59vh,590px); min-height:390px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; cursor:crosshair }
+    .legend { display:flex; gap:15px; flex-wrap:wrap; color:var(--muted); font-size:12px; padding:9px 2px 0 }
+    .legend b { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px }
+    .table-wrap { max-height:230px; overflow:auto; margin-top:10px }
+    table { width:100%; border-collapse:collapse; font-size:13px }
+    th,td { padding:7px; text-align:left; border-bottom:1px solid #e7ece8 }
+    td input { min-width:70px; min-height:32px; padding:5px }
+    .remove { min-height:29px; padding:4px 7px; color:var(--red); background:#fff4f2; border-color:#ebc7c2 }
+    pre { white-space:pre-wrap; overflow:auto; max-height:150px; background:#14221c; color:#d8e8dd; border-radius:7px; padding:10px; font:11px/1.4 ui-monospace,monospace }
+    #message { min-height:22px; color:var(--green); font-size:13px; margin-top:9px }
+    .hidden { display:none!important }
+    @media(max-width:900px) { .toolbar,.columns { grid-template-columns:1fr } header { padding:16px 20px } main { padding:14px } #mapCanvas { height:55vh } }
+  </style>
+</head>
+<body>
+<header><h1>DimOS · 仓库巡检调度台</h1><span>地图采集 · 路线编排 · 任务监控</span></header>
+<main>
+  <section class="toolbar">
+    <div class="card">
+      <h2>连接与运行模式</h2>
+      <div class="row">
+        <div><label for="mode">设备模式</label><select id="mode"><option value="simulation">仿真（MuJoCo）</option><option value="real">真机（Unitree WebRTC）</option></select></div>
+        <div><label for="robotIp">Go2 IP（真机必填）</label><input id="robotIp" placeholder="例如 192.168.123.161"></div>
+      </div>
+      <div class="notice">真机运行前请确认急停可用、机器人周围无人，并确保操作终端与 Go2 网络连通。identity 初始位姿只适用于仿真或已知固定起点。</div>
+    </div>
+    <div class="card">
+      <h2>当前作业状态</h2>
+      <div id="mappingStatus" class="status"><i class="dot"></i><span>采图：空闲</span></div>
+      <div id="patrolStatus" class="status"><i class="dot"></i><span>巡检：空闲</span></div>
+      <div id="fireAlarmStatus" class="status"><i class="dot"></i><span>火情信号：NaN（未接入）</span></div>
+      <div class="row"><div><label>采图 / 巡检运行日志</label><pre id="log">等待任务启动…</pre></div><div><label>巡检进度</label><pre id="progress">暂无活动任务</pre></div></div>
+    </div>
+  </section>
+  <section class="columns" style="margin-top:18px">
+    <div class="stack">
+      <div class="card">
+        <h2>① 远程采图建图</h2>
+        <p class="sub">启动后通过 Command Center 手动遥控覆盖区域；结束采集会自动录制、PGO 优化并导出点云地图。</p>
+          <label for="mapName">地图名称</label><input id="mapName" value="warehouse">
+        <div class="actions"><button id="startMapping" class="primary">启动采图</button><button id="stopMapping" class="stop">结束采集并导出地图</button></div>
+        <div class="status"><i class="dot"></i><span>采图控制：<a href="/command-center" target="_blank" rel="noreferrer">打开机器人 Command Center</a> · <a href="/rerun" target="_blank" rel="noreferrer">打开实时 Rerun 可视化</a></span></div>
+        <p class="sub">地图输出至 maps/&lt;名称&gt;.pc2.lcm；原始录制保存为 maps/&lt;名称&gt;.db，回放文件为 maps/&lt;名称&gt;.rrd。</p>
+      </div>
+      <div class="card">
+        <h2>② 巡检任务设置</h2>
+        <div><label for="routeSelect">加载巡检路线</label><div style="display:flex;gap:6px"><select id="routeSelect"></select><button id="loadRoute" class="secondary">加载</button></div></div>
+        <div class="status"><i class="dot"></i><span id="selectedMapSummary">巡检将使用地图工作区当前选中的地图</span></div>
+        <div class="row3">
+          <div><label for="executionMode">启动方式</label><select id="executionMode"><option value="immediate">立即开始</option><option value="daily">预约一次（下次到该时刻）</option></select></div>
+          <div><label for="duration">本次任务时长 (min)</label><input id="duration" type="number" min="1" value="30"></div>
+          <div><label for="cycleMode">运行轮次</label><select id="cycleMode"><option value="repeat" selected>持续循环至任务时长</option><option value="single">只运行一轮</option></select></div>
+        </div>
+        <div id="repeatIntervalWrap"><label for="repeat">循环间隔 (min)</label><input id="repeat" type="number" min="0" value="0"><p class="sub">持续循环模式下，0 表示本轮结束后立即开始下一轮；大于 0 表示等待指定分钟再开始。</p></div>
+        <div id="dailyTimeWrap" class="hidden"><label for="startAt">本次预约时刻</label><input id="startAt" type="time"></div>
+        <div class="row">
+          <div><label for="defaultDwell">新增巡检点停留 (s)</label><input id="defaultDwell" type="number" min="0" value="10"></div>
+          <div><label for="mapPose">真机已知初始位姿 (可选 x,y,yaw)</label><input id="mapPose" placeholder="留空则全局点云重定位"></div>
+        </div>
+        <div class="actions"><button id="startPatrol" class="primary">确认并启动巡检</button><button id="pausePatrol" class="secondary">火情 / 异常：暂停</button><button id="resumePatrol" class="secondary">确认现场安全并继续</button><button id="stopPatrol" class="stop">结束巡检并返航</button></div>
+        <p class="sub">立即开始：定位成功即执行；预约一次：路线在下一个所选 HH:MM 执行一次，若今天已过则等到次日。持续循环模式会运行至任务时长结束，间隔 0 表示不等待立即开始下一轮；只运行一轮则完成一次后返航。火情/异常暂停后需操作员确认现场安全再继续。结束巡检会从当前位置返航；硬件急停仍须独立可用。</p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>地图工作区 · 地图检查与巡检路线编辑</h2>
+      <div class="row">
+        <div><label for="mapSelect">当前地图</label><div style="display:flex;gap:6px"><select id="mapSelect"></select><button id="refreshMaps" class="secondary">刷新</button></div></div>
+        <div class="status" style="align-self:end"><i class="dot"></i><span id="mapStats">选择地图后显示点云信息</span></div>
+      </div>
+      <div class="row" style="margin-top:10px;align-items:end">
+        <div><label for="routeName">保存路线名称</label><input id="routeName" value="warehouse-patrol"></div>
+        <div class="actions" style="margin-top:0"><button id="setStart" class="secondary">设置唯一出发 / 返回点</button><button id="optimizeRoute" class="secondary">优化巡检顺序</button><button id="saveRoute" class="primary">保存路线</button></div>
+      </div>
+      <p id="message" role="status"></p>
+      <p class="sub">画布是地图的 XY 俯视点云投影，用于检查覆盖范围、墙体连续性和明显重影，并在其上编辑路线。左键添加巡检点；先点“设置唯一出发 / 返回点”再左键设置起点；右键删除最近巡检点。坐标和停留时间可在下表微调。</p>
+      <div class="map-wrap"><canvas id="mapCanvas" width="1000" height="650"></canvas></div>
+      <div class="legend"><span><b style="background:#187a52"></b>唯一出发 / 返回点</span><span><b style="background:#e25832"></b>巡检点及顺序</span><span><b style="background:#829b8c"></b>已保存地图点云</span></div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>X (m)</th><th>Y (m)</th><th>停留 (s)</th><th></th></tr></thead><tbody id="waypointRows"></tbody></table></div>
+    </div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id), canvas=$('mapCanvas'),ctx=canvas.getContext('2d');
+// This is the remote operator console: all robot actions go through the Orin agent.
+$('mode').value='real';$('mode').disabled=true;$('robotIp').closest('.row').style.display='none';
+let route={start_at:null,max_duration_s:1800,repeat_interval_s:null,return_to_start:{x:0,y:0},waypoints:[]},cloud=[],bounds=null,chooseStart=false;
+function message(text,error=false){$('message').textContent=text;$('message').style.color=error?'#a63b32':'#176447'}
+function updateExecutionMode(){const daily=$('executionMode').value==='daily';$('dailyTimeWrap').classList.toggle('hidden',!daily);$('startAt').required=daily}
+function updateCycleMode(){$('repeatIntervalWrap').classList.toggle('hidden',$('cycleMode').value==='single')}
+function toCanvas(p){const pad=40,w=(bounds?.maxX-bounds?.minX)||1,h=(bounds?.maxY-bounds?.minY)||1,s=Math.min((canvas.width-pad*2)/w,(canvas.height-pad*2)/h),ox=(canvas.width-w*s)/2,oy=(canvas.height-h*s)/2;return[ox+(p.x-bounds.minX)*s,canvas.height-oy-(p.y-bounds.minY)*s]}
+function draw(){ctx.clearRect(0,0,canvas.width,canvas.height);ctx.fillStyle='#fbfcfa';ctx.fillRect(0,0,canvas.width,canvas.height);if(!bounds)return;for(let x=0;x<canvas.width;x+=50){ctx.strokeStyle='#e7ede8';ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.strokeStyle='#e7ede8';ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}ctx.fillStyle='#829b8c';for(const [x,y] of cloud){const p=toCanvas({x,y});ctx.fillRect(p[0],p[1],2,2)}const full=[...(route.return_to_start?[route.return_to_start]:[]),...route.waypoints,...(route.return_to_start?[route.return_to_start]:[])];ctx.strokeStyle='#e25832';ctx.lineWidth=3;ctx.beginPath();full.forEach((p,i)=>{const q=toCanvas(p);i?ctx.lineTo(...q):ctx.moveTo(...q)});ctx.stroke();if(route.return_to_start){const p=toCanvas(route.return_to_start);ctx.fillStyle='#187a52';ctx.beginPath();ctx.arc(...p,10,0,Math.PI*2);ctx.fill();ctx.fillStyle='#172923';ctx.fillText('START / HOME',p[0]+13,p[1]-10)}route.waypoints.forEach((p,i)=>{const q=toCanvas(p);ctx.fillStyle='#e25832';ctx.beginPath();ctx.arc(...q,9,0,Math.PI*2);ctx.fill();ctx.fillStyle='#172923';ctx.fillText(String(i+1),q[0]+12,q[1]-10)});renderRows()}
+function renderRows(){$('waypointRows').innerHTML=route.waypoints.map((p,i)=>`<tr><td>${i+1}</td><td><input type="number" step="0.01" value="${p.x}" data-index="${i}" data-field="x"></td><td><input type="number" step="0.01" value="${p.y}" data-index="${i}" data-field="y"></td><td><input type="number" min="0" step="1" value="${p.dwell_s||0}" data-index="${i}" data-field="dwell_s"></td><td><button class="remove" data-remove="${i}">移除</button></td></tr>`).join('')}
+function canvasPoint(event){const rect=canvas.getBoundingClientRect(),scaleX=canvas.width/rect.width,scaleY=canvas.height/rect.height;const cx=(event.clientX-rect.left)*scaleX,cy=(event.clientY-rect.top)*scaleY,pad=40,w=bounds.maxX-bounds.minX||1,h=bounds.maxY-bounds.minY||1,s=Math.min((canvas.width-pad*2)/w,(canvas.height-pad*2)/h),ox=(canvas.width-w*s)/2,oy=(canvas.height-h*s)/2;return{x:+(bounds.minX+(cx-ox)/s).toFixed(2),y:+(bounds.minY+(canvas.height-oy-cy)/s).toFixed(2)}}
+canvas.oncontextmenu=e=>e.preventDefault();canvas.onmousedown=e=>{if(!bounds)return;if(e.button===2){route.waypoints.pop()}else if(e.button===0){const p=canvasPoint(e);if(chooseStart){route.return_to_start=p;chooseStart=false;$('setStart').textContent='设置唯一出发 / 返回点'}else route.waypoints.push({...p,dwell_s:+$('defaultDwell').value})}draw()};
+$('waypointRows').oninput=e=>{const i=Number(e.target.dataset.index),field=e.target.dataset.field;if(Number.isInteger(i)&&field){route.waypoints[i][field]=Number(e.target.value);draw()}};$('waypointRows').onclick=e=>{if(e.target.dataset.remove!==undefined){route.waypoints.splice(Number(e.target.dataset.remove),1);draw()}};
+async function loadMapPoints(){const name=$('mapSelect').value;if(!name)return;message('正在加载点云地图…');const response=await fetch('/api/map-points?map='+encodeURIComponent(name));const data=await response.json();if(!response.ok){message(data.error||'地图加载失败',true);return}cloud=data;const xs=cloud.map(p=>p[0]),ys=cloud.map(p=>p[1]);bounds={minX:Math.min(...xs),maxX:Math.max(...xs),minY:Math.min(...ys),maxY:Math.max(...ys)};draw();const width=(bounds.maxX-bounds.minX).toFixed(1),height=(bounds.maxY-bounds.minY).toFixed(1);$('mapStats').textContent=`${name} · ${cloud.length.toLocaleString()} 个显示点 · XY 覆盖约 ${width} × ${height} m`;$('selectedMapSummary').textContent=`巡检使用地图：${name}`;message(`地图已加载：${cloud.length.toLocaleString()} 个显示点`)}
+async function refreshLists(){const oldMap=$('mapSelect').value,oldRoute=$('routeSelect').value;const [maps,routes]=await Promise.all([fetch('/api/maps').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);$('mapSelect').innerHTML=maps.map(n=>`<option>${n}</option>`).join('');$('routeSelect').innerHTML=routes.map(n=>`<option>${n}</option>`).join('');if(maps.includes(oldMap))$('mapSelect').value=oldMap;else if(maps.includes('warehouse.pc2.lcm'))$('mapSelect').value='warehouse.pc2.lcm';if(routes.includes(oldRoute))$('routeSelect').value=oldRoute;else if(routes.includes('warehouse-patrol.json'))$('routeSelect').value='warehouse-patrol.json';if(maps.length)await loadMapPoints()}
+async function loadRoute(){const data=await fetch('/api/route?name='+encodeURIComponent($('routeSelect').value)).then(r=>r.json());if(data.error){message(data.error,true);return}route={return_to_start:data.return_to_start||null,waypoints:data.waypoints||[]};$('routeName').value=$('routeSelect').value.replace(/\.json$/,'');$('startAt').value=data.start_at||'';$('executionMode').value=data.start_at?'daily':'immediate';updateExecutionMode();$('duration').value=(data.max_duration_s||1800)/60;$('repeat').value=(data.repeat_interval_s||0)/60;draw();message('路线已加载')}
+function routePayload(){return{...route,return_to_start:route.return_to_start,waypoints:route.waypoints}}
+function routeDistance(points){const home=route.return_to_start;if(!home)return NaN;let total=0,previous=home;for(const point of points){total+=Math.hypot(point.x-previous.x,point.y-previous.y);previous=point}return total+Math.hypot(home.x-previous.x,home.y-previous.y)}
+function optimizeWaypointOrder(){const points=route.waypoints,home=route.return_to_start;if(!home){message('请先设置唯一出发 / 返回点，再优化巡检顺序。',true);return}const n=points.length;if(n<2){message('至少需要两个巡检点才能优化顺序。',true);return}const before=routeDistance(points),distance=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);let order=[];if(n<=12){const size=1<<n,dp=Array.from({length:size},()=>new Float64Array(n).fill(Infinity)),parent=Array.from({length:size},()=>new Int8Array(n).fill(-1));for(let i=0;i<n;i++)dp[1<<i][i]=distance(home,points[i]);for(let mask=1;mask<size;mask++)for(let last=0;last<n;last++)if(mask&(1<<last)){const previousMask=mask^(1<<last);if(!previousMask)continue;for(let previous=0;previous<n;previous++)if(previousMask&(1<<previous)){const candidate=dp[previousMask][previous]+distance(points[previous],points[last]);if(candidate<dp[mask][last]){dp[mask][last]=candidate;parent[mask][last]=previous}}}let mask=size-1,last=0,best=Infinity;for(let i=0;i<n;i++){const candidate=dp[mask][i]+distance(points[i],home);if(candidate<best){best=candidate;last=i}}while(mask){order.unshift(last);const previous=parent[mask][last];mask^=1<<last;if(mask)last=previous}}else{const remaining=new Set(points.map((_,i)=>i));let current=home;while(remaining.size){let chosen=-1,best=Infinity;for(const i of remaining){const cost=distance(current,points[i]);if(cost<best){best=cost;chosen=i}}order.push(chosen);remaining.delete(chosen);current=points[chosen]}let improved=true;while(improved){improved=false;for(let i=0;i<n-1;i++)for(let j=i+1;j<n;j++){const a=i===0?home:points[order[i-1]],b=points[order[i]],c=points[order[j]],d=j===n-1?home:points[order[j+1]];if(distance(a,c)+distance(b,d)<distance(a,b)+distance(c,d)-1e-9){order.splice(i,j-i+1,...order.slice(i,j+1).reverse());improved=true}}}}route.waypoints=order.map(i=>points[i]);draw();const after=routeDistance(route.waypoints);message(`已优化顺序：估算往返 ${before.toFixed(1)} m → ${after.toFixed(1)} m（直线距离，不含障碍绕行）`)}
+$('refreshMaps').onclick=refreshLists;$('mapSelect').onchange=loadMapPoints;$('routeSelect').onchange=loadRoute;$('loadRoute').onclick=loadRoute;$('setStart').onclick=()=>{chooseStart=true;$('setStart').textContent='请在地图上点击唯一出发 / 返回点'};
+$('executionMode').onchange=updateExecutionMode;
+$('cycleMode').onchange=updateCycleMode;
+$('optimizeRoute').onclick=optimizeWaypointOrder;
+$('saveRoute').onclick=async()=>{const payload=routePayload();if(!payload)return false;const response=await fetch('/api/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('routeName').value,route:payload})});const data=await response.json();if(!response.ok){message(data.error,true);return false}await refreshLists();$('routeSelect').value=data.name;message(`路线已保存：${data.name}`);return true};
+$('startMapping').onclick=async()=>{const response=await fetch('/api/mapping/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('mapName').value,mode:$('mode').value,robot_ip:$('robotIp').value})});const data=await response.json();message(response.ok?'采图任务已启动。打开 Command Center 遥控机器人覆盖区域。':data.error,!response.ok)};
+$('stopMapping').onclick=async()=>{const response=await fetch('/api/mapping/stop',{method:'POST'});const data=await response.json();message(response.ok?'已请求停止采集；PGO 地图导出正在进行。':data.error,!response.ok)};
+$('startPatrol').onclick=async()=>{if($('executionMode').value==='daily'&&!$('startAt').value){message('请选择本次预约时刻。',true);return}if(!await $('saveRoute').onclick())return;const response=await fetch('/api/patrol/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map:$('mapSelect').value,route:$('routeSelect').value,mode:$('mode').value,robot_ip:$('robotIp').value,initial_pose:$('mapPose').value,execution_mode:$('executionMode').value,start_at:$('executionMode').value==='daily'?$('startAt').value:'',max_duration_s:+$('duration').value*60,repeat_enabled:$('cycleMode').value==='repeat',repeat_interval_s:+$('repeat').value*60})});const data=await response.json();message(response.ok?'巡检进程已启动：正在加载地图并等待定位成功。':data.error,!response.ok)};
+async function patrolCommand(endpoint,successText){const response=await fetch(endpoint,{method:'POST'});const data=await response.json();message(response.ok?successText:data.error,!response.ok)}
+$('pausePatrol').onclick=()=>patrolCommand('/api/patrol/fire-alarm','已请求火情/异常暂停；机器人会停止当前导航并等待人工确认。');
+$('resumePatrol').onclick=()=>patrolCommand('/api/patrol/resume','已确认现场安全；巡检将继续原目标。');
+$('stopPatrol').onclick=()=>patrolCommand('/api/patrol/stop','已请求结束；机器人将返航后关闭任务。');
+function setStatus(element,active,text,isError=false){element.querySelector('.dot').className='dot'+(isError?' error':active?' running':'');element.querySelector('span').textContent=text}
+async function pollStatus(){try{const state=await fetch('/api/status').then(r=>r.json());const mapText={recording:'采集中 · LiDAR / odom / camera 正在录制',exporting:'采集结束 · PGO 导图中',map_ready:'地图已导出',idle:'采图：空闲'};setStatus($('mappingStatus'),state.mapping.running,state.mapping.running?mapText[state.mapping.phase]||'采图运行中':mapText[state.mapping.phase]||'采图：空闲');const fire=state.fire_alarm||{state:'NaN',events:[]};const lastFire=fire.events?.at(-1);setStatus($('fireAlarmStatus'),fire.state==='Fire_alarm',`火情信号：${fire.state}${lastFire?.timestamp?` · ${lastFire.timestamp}`:''}${fire.source?` · ${fire.source}`:''}`,fire.state==='Fire_alarm');const p=state.patrol;const active=p.running||['localizing','initializing','waiting_for_localization','waiting_for_start','scheduled','navigating','dwell','returning','waiting','paused_fire'].includes(p.phase);setStatus($('patrolStatus'),active,`巡检：${p.phase||'idle'} · ${p.message||''}`,p.phase==='error');const tf=p.map_to_world,align=tf?`Map→World: Δx=${tf.translation[0].toFixed(2)}m Δy=${tf.translation[1].toFixed(2)}m`:'Map→World: 等待定位';$('progress').textContent=[`阶段：${p.phase||'idle'}`,`周期：${p.cycle||0}`,`点位：${p.index||0}/${p.total||0}`,p.x!==undefined?`目标地图坐标：(${p.x}, ${p.y})`:'',p.world_x!==undefined?`下发世界坐标：(${p.world_x.toFixed(2)}, ${p.world_y.toFixed(2)})`:'',align,`更新时间：${p.updated_at||'—'}`].filter(Boolean).join('\n');$('log').textContent=[...(state.mapping.log||[]),...(p.log||[])].slice(-18).join('\n')||'等待任务启动…'}catch(e){$('log').textContent=String(e)}}
+updateCycleMode();
+refreshLists().then(()=>loadRoute());pollStatus();setInterval(pollStatus,2000);
+</script>
+</body></html>

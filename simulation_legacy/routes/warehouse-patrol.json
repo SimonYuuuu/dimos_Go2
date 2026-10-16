@@ -1,0 +1,15 @@
+{
+  "start_at": null,
+  "max_duration_s": 1800,
+  "repeat_interval_s": null,
+  "return_to_start": {
+    "x": -1.0,
+    "y": 1.0
+  },
+  "waypoints": [
+    {"x": 4.0, "y": 5.0, "dwell_s": 10},
+    {"x": -1.7, "y": 5.0, "dwell_s": 10},
+    {"x": -3.8, "y": -1.5, "dwell_s": 10},
+    {"x": 3.4, "y": -5.0, "dwell_s": 10}
+  ]
+}

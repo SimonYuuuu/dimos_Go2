@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.rrd
+*.pc2.lcm
+robot_data/
+logs/*.log
+logs/*.jsonl
+logs/*.json
+remote_client/data/

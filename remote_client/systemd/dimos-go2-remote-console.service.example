@@ -1,0 +1,21 @@
+[Unit]
+Description=DimOS Go2 remote operator console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dimos-operator
+Group=dimos-operator
+WorkingDirectory=/opt/dimos_Go2
+EnvironmentFile=/etc/dimos-go2/remote-console.env
+ExecStart=/opt/dimos_Go2/start_remote_console.sh
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/dimos_Go2/remote_client/data /opt/dimos_Go2/logs
+
+[Install]
+WantedBy=multi-user.target
