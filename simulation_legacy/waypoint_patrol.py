@@ -26,9 +26,11 @@ from pathlib import Path
 
 from dimos.core.transport import LCMTransport
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos_lcm.std_msgs import Bool
 
 GOAL_TIMEOUT_S = 60.0
+COSTMAP_TIMEOUT_S = 60.0
 
 
 def load_route(
@@ -153,12 +155,21 @@ def run_patrol(
     goal_request = LCMTransport("/goal_request", PoseStamped)
     reached = LCMTransport("/goal_reached", Bool)
     stop_movement = LCMTransport("/stop_movement", Bool)
+    costmap_ready = threading.Event()
+
+    def _on_global_costmap(msg: OccupancyGrid) -> None:
+        grid = getattr(msg, "grid", None)
+        if msg.width > 0 and msg.height > 0 and getattr(grid, "size", 0) > 0:
+            costmap_ready.set()
+
+    global_costmap = LCMTransport("/global_costmap", OccupancyGrid)
     reached.subscribe(_on_goal_reached)
+    global_costmap.subscribe(_on_global_costmap)
 
     # Let the subscription attach before the first publish.
     time.sleep(0.5)
 
-    deadline = time.monotonic() + max_duration_s if max_duration_s else None
+    deadline: float | None = None
     cycle = 0
 
     def stop_requested() -> bool:
@@ -298,12 +309,13 @@ def run_patrol(
     stop_reason = "completed"
     failure: str | None = None
     home_reached = False
+    navigation_ready = False
 
     def finish_patrol(reason: str, error: str | None = None) -> None:
         nonlocal stop_reason, failure, home_reached
         stop_reason = reason
         failure = error
-        if return_to_start is not None:
+        if return_to_start is not None and navigation_ready:
             while read_control(control_file).get("paused"):
                 write_status(
                     status_file,
@@ -351,7 +363,43 @@ def run_patrol(
         print(final_message, flush=True)
 
     try:
-        if return_to_start is not None:
+        costmap_deadline = time.monotonic() + COSTMAP_TIMEOUT_S
+        while not costmap_ready.wait(timeout=0.1):
+            if stop_requested():
+                stop_reason = "stopped"
+                failure = "Patrol stopped before a navigation costmap was available"
+                break
+            if read_control(control_file).get("paused"):
+                write_status(
+                    status_file,
+                    phase="paused_fire",
+                    cycle=0,
+                    index=0,
+                    total=len(waypoints),
+                    message="Fire alarm active; waiting for Safe before navigation setup",
+                )
+                if time.monotonic() >= costmap_deadline:
+                    stop_reason = "error"
+                    failure = "Fire alarm remained active while waiting for /global_costmap; no navigation goal was sent"
+                    break
+                continue
+            if time.monotonic() >= costmap_deadline:
+                stop_reason = "error"
+                failure = "No valid /global_costmap received within 60s; no navigation goal was sent"
+                break
+            write_status(
+                status_file,
+                phase="waiting_for_costmap",
+                cycle=0,
+                index=0,
+                total=len(waypoints),
+                message="Localization is ready; waiting for the navigation costmap before dispatching goals",
+            )
+        navigation_ready = costmap_ready.is_set()
+        if navigation_ready:
+            deadline = time.monotonic() + max_duration_s if max_duration_s else None
+
+        if stop_reason == "completed" and return_to_start is not None:
             result = navigate(*return_to_start, "initializing", 0, 0, len(waypoints))
             if result == "reached":
                 home_reached = True

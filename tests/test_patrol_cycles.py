@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from dimos_lcm.std_msgs import Bool  # noqa: E402
 class FakeTransport:
     instances = {}
     goals = []
+    costmap_available = True
 
     def __init__(self, topic, _message_type):
         self.topic = topic
@@ -24,6 +26,8 @@ class FakeTransport:
 
     def subscribe(self, callback):
         self.callbacks.append(callback)
+        if self.topic == "/global_costmap" and FakeTransport.costmap_available:
+            callback(SimpleNamespace(width=10, height=10, grid=SimpleNamespace(size=100)))
         return callback
 
     def broadcast(self, _channel, message):
@@ -35,9 +39,10 @@ class FakeTransport:
 
 
 class PatrolCycleTests(unittest.TestCase):
-    def run_patrol(self, repeat_enabled):
+    def run_patrol(self, repeat_enabled, costmap_available=True):
         FakeTransport.instances = {}
         FakeTransport.goals = []
+        FakeTransport.costmap_available = costmap_available
         with tempfile.TemporaryDirectory() as temp:
             control = Path(temp) / "control.json"
             status = Path(temp) / "status.json"
@@ -46,7 +51,7 @@ class PatrolCycleTests(unittest.TestCase):
                 patrol.run_patrol(
                     [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
                     (0.0, 0.0),
-                    0.16 if repeat_enabled else 5.0,
+                    1.5 if repeat_enabled else 5.0,
                     0.02,
                     status,
                     None,
@@ -67,6 +72,13 @@ class PatrolCycleTests(unittest.TestCase):
         goals, status = self.run_patrol(repeat_enabled=False)
         self.assertEqual(goals, [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (0.0, 0.0)])
         self.assertEqual(status["phase"], "completed")
+
+    def test_missing_costmap_sends_no_navigation_goal(self):
+        with patch.object(patrol, "COSTMAP_TIMEOUT_S", 0.02):
+            goals, status = self.run_patrol(repeat_enabled=False, costmap_available=False)
+        self.assertEqual(goals, [])
+        self.assertEqual(status["phase"], "error")
+        self.assertIn("No valid /global_costmap", status["message"])
 
 
 if __name__ == "__main__":

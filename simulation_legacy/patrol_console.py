@@ -127,6 +127,41 @@ def _occupied_service_ports() -> list[int]:
     return occupied
 
 
+def _lcm_network_error() -> str | None:
+    try:
+        link = subprocess.run(
+            ["ip", "-o", "link", "show", "dev", "lo"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        route = subprocess.run(
+            ["ip", "route", "show", "224.0.0.0/4", "dev", "lo"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        return f"Cannot inspect LCM loopback networking: {error}"
+    missing: list[str] = []
+    if link.returncode != 0 or "MULTICAST" not in link.stdout:
+        missing.append("enable loopback multicast")
+    if route.returncode != 0 or not route.stdout.strip():
+        missing.append("add the loopback multicast route")
+    if not missing:
+        return None
+    return (
+        "LCM loopback networking is not configured ("
+        + " and ".join(missing)
+        + "). Configure it once on the Linux host with administrator privileges; "
+        "this VS Code/container environment may block sudo: "
+        "sudo ip link set lo multicast on && "
+        "sudo ip route replace 224.0.0.0/4 dev lo && "
+        "sudo sysctl -w net.core.rmem_max=67108864 && "
+        "sudo sysctl -w net.core.rmem_default=67108864"
+    )
+
+
 @app.get("/")
 def index() -> Any:
     return send_file(PAGE_FILE)
@@ -202,6 +237,9 @@ def start_mapping() -> Any:
         return jsonify(error=str(error)), 400
     if mode == "real" and not body.get("robot_ip"):
         return jsonify(error="Enter the robot IP for real-robot mapping."), 400
+    lcm_error = _lcm_network_error()
+    if lcm_error:
+        return jsonify(error=lcm_error), 409
     if _occupied_service_ports():
         return jsonify(error=f"DimOS/Rerun ports already in use: {_occupied_service_ports()}. Stop the existing run first."), 409
     with lock:
@@ -259,6 +297,9 @@ def start_patrol() -> Any:
         return jsonify(error="Duration and repeat interval must be numeric."), 400
     if max_duration_s <= 0 or repeat_interval_s < 0:
         return jsonify(error="Duration must be positive and repeat interval cannot be negative."), 400
+    lcm_error = _lcm_network_error()
+    if lcm_error:
+        return jsonify(error=lcm_error), 409
     repeat_enabled = body.get("repeat_enabled", False)
     if not isinstance(repeat_enabled, bool):
         return jsonify(error="repeat_enabled must be true or false."), 400
@@ -385,6 +426,39 @@ def status() -> Any:
     except (OSError, json.JSONDecodeError):
         localization = None
     mapping_log = _tail(mapping_log_path)
+    patrol_log = _tail(patrol_log_path, limit=80)
+    patrol_running = _process_running(patrol_proc)
+    patrol_phase = patrol.get("phase", "idle")
+    active_phases = {
+        "localizing",
+        "initializing",
+        "waiting_for_localization",
+        "waiting_for_costmap",
+        "waiting_for_start",
+        "scheduled",
+        "navigating",
+        "dwell",
+        "returning",
+        "waiting",
+        "paused_fire",
+    }
+    if not patrol_running and patrol_phase in active_phases:
+        exit_code = patrol_proc.poll() if patrol_proc is not None else None
+        diagnostic = next(
+            (
+                line.strip()
+                for line in reversed(patrol_log)
+                if "CalledProcessError:" in line or "Error:" in line or "No such file" in line
+            ),
+            "Patrol launcher exited before localization completed.",
+        )
+        patrol = {
+            **patrol,
+            "phase": "error",
+            "message": f"Patrol process is no longer running (exit {exit_code}): {diagnostic}",
+            "exit_code": exit_code,
+        }
+        patrol_phase = "error"
     try:
         control = json.loads(CONTROL_FILE.read_text())
         if not isinstance(control, dict):
@@ -409,8 +483,8 @@ def status() -> Any:
         },
         patrol={
             **patrol,
-            "running": _process_running(patrol_proc),
-            "log": _tail(patrol_log_path),
+            "running": patrol_running,
+            "log": patrol_log,
             "map_to_world": localization,
         },
     )

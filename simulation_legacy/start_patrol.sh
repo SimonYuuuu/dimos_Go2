@@ -11,7 +11,7 @@ RELOCALIZATION_ARGS=(-o "relocalizationmodule.map_file=$MAP" -o relocalizationmo
 STATUS_FILE="${PATROL_STATUS_FILE:-$ROOT/maps/patrol-status.json}"
 TRANSFORM_FILE="${PATROL_TRANSFORM_FILE:-$ROOT/maps/map-to-world.json}"
 CONTROL_FILE="${PATROL_CONTROL_FILE:-$ROOT/maps/patrol-control.json}"
-LOG_FILE="$ROOT/logs/patrol-dimos.log"
+LOG_FILE="${PATROL_DIMOS_LOG_FILE:-$ROOT/logs/patrol-dimos.log}"
 DIMOS_PID=""
 STOPPING=0
 
