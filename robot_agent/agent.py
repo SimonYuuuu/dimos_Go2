@@ -8,6 +8,7 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -29,12 +30,19 @@ MAPPING_LOG = DATA / "mapping.log"
 PATROL_LOG = DATA / "patrol.log"
 TOKEN = os.environ.get("ROBOT_AGENT_TOKEN", "")
 ROBOT_IP = os.environ.get("ROBOT_IP", "")
-AES_KEY = os.environ.get("UNITREE_AES_128_KEY", "")
+LIDAR_IP = os.environ.get("LIDAR_IP", "192.168.123.20")
+# DimOS 0.0.15 rejects UNITREE_AES_128_KEY; the module env is GO2CONNECTION__AES_128_KEY.
+AES_KEY = os.environ.get("GO2CONNECTION__AES_128_KEY") or os.environ.get("UNITREE_AES_128_KEY", "")
 DIMOS_MODE = os.environ.get("DIMOS_MODE", "real")
+DIMOS_BIN = SIM_ROOT / ".venv" / "bin" / "dimos"
 app = Flask(__name__)
 lock = threading.RLock()
 mapping_proc: subprocess.Popen[bytes] | None = None
+mapping_name: str | None = None
 patrol_proc: subprocess.Popen[bytes] | None = None
+_reachability: dict[str, Any] = {"checked_at": 0.0}
+_export_lock = threading.Lock()
+_export_status: dict[str, Any] = {"name": None, "running": False, "error": None, "path": None}
 
 DATA.mkdir(parents=True, exist_ok=True)
 ROUTES.mkdir(parents=True, exist_ok=True)
@@ -66,11 +74,131 @@ def _running(proc: subprocess.Popen[bytes] | None) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def _dimos_stop() -> None:
+    if not DIMOS_BIN.is_file():
+        return
+    try:
+        subprocess.run(
+            [str(DIMOS_BIN), "stop"],
+            cwd=str(SIM_ROOT),
+            timeout=60,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _export_map_async(name: str) -> None:
+    db = MAPS / f"{name}.db"
+    out = MAPS / f"{name}.pc2.lcm"
+    if not db.is_file():
+        with _export_lock:
+            _export_status.update(name=name, running=False, error=f"missing {db.name}", path=None)
+        return
+    if out.is_file():
+        with _export_lock:
+            _export_status.update(name=name, running=False, error=None, path=str(out))
+        return
+    with _export_lock:
+        if _export_status.get("running") and _export_status.get("name") == name:
+            return
+        _export_status.update(name=name, running=True, error=None, path=None)
+
+    def worker() -> None:
+        try:
+            env = os.environ.copy()
+            gomp = "/lib/aarch64-linux-gnu/libgomp.so.1"
+            if Path(gomp).is_file():
+                preload = env.get("LD_PRELOAD", "")
+                if gomp not in preload.split(":"):
+                    env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
+            with MAPPING_LOG.open("ab") as log:
+                log.write(f"\n=== export_map {name} ===\n".encode())
+                completed = subprocess.run(
+                    ["bash", str(SIM_ROOT / "export_map.sh"), str(db), str(out)],
+                    cwd=str(SIM_ROOT),
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            err = None if completed.returncode == 0 and out.is_file() else f"export exit {completed.returncode}"
+            with _export_lock:
+                _export_status.update(
+                    name=name,
+                    running=False,
+                    error=err,
+                    path=str(out) if out.is_file() else None,
+                )
+        except OSError as error:
+            with _export_lock:
+                _export_status.update(name=name, running=False, error=str(error), path=None)
+
+    threading.Thread(target=worker, name=f"export-{name}", daemon=True).start()
+
+
 def _safe_name(value: object) -> str:
     name = Path(str(value or "")).name
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("Name must use only letters, digits, underscores, and hyphens.")
     return name
+
+
+def _token_ok(header: str) -> bool:
+    prefix = "Bearer "
+    if not TOKEN or not header.startswith(prefix):
+        return False
+    supplied = header[len(prefix) :]
+    if len(supplied) != len(TOKEN):
+        return False
+    return hmac.compare_digest(supplied, TOKEN)
+
+
+def _tcp_open(host: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ping(ip: str) -> bool | None:
+    if not ip:
+        return None
+    try:
+        completed = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _connectivity() -> dict[str, Any]:
+    now = time.time()
+    cached = _reachability
+    if now - float(cached.get("checked_at") or 0) < 8:
+        return {k: v for k, v in cached.items() if k != "checked_at"}
+    snapshot = {
+        "robot_ip": ROBOT_IP,
+        "robot_reachable": _ping(ROBOT_IP),
+        "lidar_ip": LIDAR_IP,
+        "lidar_reachable": _ping(LIDAR_IP),
+        "dimos_installed": DIMOS_BIN.is_file(),
+        "command_center": _tcp_open("127.0.0.1", 7779),
+        "rerun": _tcp_open("127.0.0.1", 9878),
+        "webrtc_signaling": bool(ROBOT_IP)
+        and (_tcp_open(ROBOT_IP, 9991) or _tcp_open(ROBOT_IP, 8081)),
+    }
+    cached.clear()
+    cached.update(checked_at=now, **snapshot)
+    return snapshot
 
 
 def _control(**updates: object) -> dict[str, Any]:
@@ -111,16 +239,14 @@ if not CONTROL_FILE.exists():
 def require_agent_token():
     if request.endpoint == "health":
         return None
-    supplied = request.headers.get("Authorization", "")
-    expected = f"Bearer {TOKEN}"
-    if not TOKEN or not hmac.compare_digest(supplied, expected):
+    if not _token_ok(request.headers.get("Authorization", "")):
         return jsonify(error="Unauthorized robot-agent request."), 401
     return None
 
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, service="dimos-go2-robot-agent", mode=DIMOS_MODE)
+    return jsonify(ok=True, service="dimos-go2-robot-agent", mode=DIMOS_MODE, robot_ip=ROBOT_IP)
 
 
 @app.get("/api/v1/status")
@@ -129,11 +255,23 @@ def status():
     patrol = _read_json(STATUS_FILE, {"phase": "idle", "message": "No patrol status yet."})
     if not isinstance(control, dict):
         control = {}
+    connectivity = _connectivity()
     return jsonify(
-        robot={"mode": DIMOS_MODE, "robot_ip": ROBOT_IP, "online": True},
+        robot={
+            "mode": DIMOS_MODE,
+            "robot_ip": ROBOT_IP,
+            "online": bool(connectivity.get("robot_reachable")),
+        },
+        connectivity=connectivity,
         mapping={
             "running": _running(mapping_proc),
-            "phase": "recording" if _running(mapping_proc) else "idle",
+            "name": mapping_name,
+            "phase": (
+                "recording"
+                if _running(mapping_proc)
+                else ("exporting" if _export_status.get("running") else "idle")
+            ),
+            "export": dict(_export_status),
             "log": _tail(MAPPING_LOG, 60),
         },
         patrol={**patrol, "running": _running(patrol_proc), "log": _tail(PATROL_LOG, 80)},
@@ -194,12 +332,12 @@ def map_points(name: str):
     if not safe.endswith(".pc2.lcm") or not path.is_file():
         return jsonify(error="Map not found."), 404
     try:
-        from pointcloud_preview import read_xy
+        from pointcloud_preview import read_xyz
 
-        points = read_xy(path, max_points=30000)
+        points = read_xyz(path, max_points=30000)
     except Exception as error:  # Surface decoder errors to the operator for diagnosis.
         return jsonify(error=f"Could not decode map: {error}"), 422
-    return jsonify(points.round(3).tolist())
+    return jsonify(points=points.round(3).tolist(), format="xyz")
 
 
 @app.get("/api/v1/maps/<name>/artifact/<kind>")
@@ -216,7 +354,7 @@ def map_artifact(name: str, kind: str):
 
 @app.post("/api/v1/mapping/start")
 def start_mapping():
-    global mapping_proc
+    global mapping_proc, mapping_name
     body = request.get_json(silent=True) or {}
     try:
         name = _safe_name(body.get("name", "go2-map"))
@@ -226,16 +364,37 @@ def start_mapping():
         return jsonify(error="Robot agent only accepts real-robot tasks; simulation stays in simulation_legacy."), 409
     if not ROBOT_IP:
         return jsonify(error="Configure ROBOT_IP on the robot agent host."), 503
-    if not ROBOT_IP:
-        return jsonify(error="Configure ROBOT_IP on the robot agent host."), 503
+    if not DIMOS_BIN.is_file():
+        return jsonify(error="DimOS is not installed in simulation_legacy/.venv on the robot."), 503
     with lock:
         if _running(mapping_proc) or _running(patrol_proc):
             return jsonify(error="Another robot task is already active."), 409
+        if _export_status.get("running"):
+            return jsonify(error="Map export is still running; wait before starting a new capture."), 409
         env = os.environ.copy()
         env.pop("ROBOT_AGENT_TOKEN", None)
+        env.pop("UNITREE_AES_128_KEY", None)
         env.update(DIMOS_MODE="real", ROBOT_IP=ROBOT_IP)
         if AES_KEY:
-            env["UNITREE_AES_128_KEY"] = AES_KEY
+            env["GO2CONNECTION__AES_128_KEY"] = AES_KEY
+        gomp = "/lib/aarch64-linux-gnu/libgomp.so.1"
+        if Path(gomp).is_file():
+            preload = env.get("LD_PRELOAD", "")
+            if gomp not in preload.split(":"):
+                env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
+        tj_dir = SIM_ROOT / ".local-libs"
+        for tj in (
+            Path("/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0"),
+            tj_dir / "libturbojpeg.so.0",
+            tj_dir / "libturbojpeg.so",
+        ):
+            if tj.is_file():
+                lib_dir = str(tj.parent)
+                ld_path = env.get("LD_LIBRARY_PATH", "")
+                if lib_dir not in ld_path.split(":"):
+                    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_path}" if ld_path else lib_dir
+                env.setdefault("TURBOJPEG", str(tj))
+                break
         with MAPPING_LOG.open("wb") as log:
             mapping_proc = subprocess.Popen(
                 ["bash", str(SIM_ROOT / "start_mapping.sh"), name],
@@ -245,15 +404,69 @@ def start_mapping():
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        mapping_name = name
     return jsonify(ok=True, pid=mapping_proc.pid, name=name)
 
 
 @app.post("/api/v1/mapping/stop")
 def stop_mapping():
-    if not _running(mapping_proc):
-        return jsonify(error="No mapping session is running."), 409
-    os.killpg(mapping_proc.pid, signal.SIGINT)
-    return jsonify(ok=True, message="Mapping stop requested; map optimization/export follows.")
+    global mapping_proc, mapping_name
+    with lock:
+        proc = mapping_proc
+        name = mapping_name
+        if not _running(proc):
+            return jsonify(error="No mapping session is running."), 409
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    stopped = False
+    try:
+        if proc.wait(timeout=25) is not None:
+            stopped = True
+    except subprocess.TimeoutExpired:
+        _dimos_stop()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=20)
+            stopped = True
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            stopped = proc.poll() is not None
+
+    with lock:
+        if mapping_proc is proc and not _running(proc):
+            mapping_proc = None
+
+    export_started = False
+    if name:
+        db = MAPS / f"{name}.db"
+        out = MAPS / f"{name}.pc2.lcm"
+        if out.is_file():
+            with _export_lock:
+                _export_status.update(name=name, running=False, error=None, path=str(out))
+        elif db.is_file():
+            _export_map_async(name)
+            export_started = True
+
+    return jsonify(
+        ok=True,
+        stopped=stopped,
+        name=name,
+        export_started=export_started,
+        message="Mapping stopped; map optimization/export continues on the robot if needed.",
+    )
 
 
 @app.post("/api/v1/patrol/start")
@@ -306,6 +519,7 @@ def start_patrol():
             return jsonify(error="Another robot task is already active."), 409
         env = os.environ.copy()
         env.pop("ROBOT_AGENT_TOKEN", None)
+        env.pop("UNITREE_AES_128_KEY", None)
         env.update(
             DIMOS_MODE="real",
             ROBOT_IP=ROBOT_IP,
@@ -318,7 +532,12 @@ def start_patrol():
             PATROL_REPEAT_ENABLED="1" if repeat_enabled else "0",
         )
         if AES_KEY:
-            env["UNITREE_AES_128_KEY"] = AES_KEY
+            env["GO2CONNECTION__AES_128_KEY"] = AES_KEY
+        gomp = "/lib/aarch64-linux-gnu/libgomp.so.1"
+        if Path(gomp).is_file():
+            preload = env.get("LD_PRELOAD", "")
+            if gomp not in preload.split(":"):
+                env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
         if body.get("initial_pose"):
             env["DIMOS_INITIAL_POSE"] = str(body["initial_pose"])
         current_control = _read_json(CONTROL_FILE, {})

@@ -2,12 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/dimos_cli.sh"
 DIMOS="$ROOT/.venv/bin/dimos"
 NAME="${1:-warehouse}"
 DB="$ROOT/maps/${NAME}.db"
 MAP="$ROOT/maps/${NAME}.pc2.lcm"
 MODE="${DIMOS_MODE:-simulation}"
-GLOBAL_ARGS=()
 
 if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "Map name must contain only letters, digits, underscores or hyphens." >&2
@@ -22,51 +23,46 @@ if command -v ss >/dev/null 2>&1 && ss -ltnH | awk '{print $4}' | grep -Eq ':(77
   exit 3
 fi
 
-case "$MODE" in
-  simulation)
-    GLOBAL_ARGS+=(--simulation mujoco)
-    ;;
-  real)
-    if [[ -z "${ROBOT_IP:-}" ]]; then
-      echo "Set ROBOT_IP to the Go2 address before starting real mapping." >&2
-      exit 2
-    fi
-    GLOBAL_ARGS+=(--robot-ip "$ROBOT_IP")
-    if [[ -n "${UNITREE_AES_128_KEY:-}" ]]; then
-      GLOBAL_ARGS+=(--unitree-aes-128-key "$UNITREE_AES_128_KEY")
-    fi
-    ;;
-  *)
-    echo "DIMOS_MODE must be 'simulation' or 'real'." >&2
-    exit 2
-    ;;
-esac
+if ! "$ROOT/.venv/bin/python" -c "import yaml" >/dev/null 2>&1; then
+  echo "DimOS venv is missing PyYAML. On Orin run: simulation_legacy/.venv/bin/python -m pip install PyYAML" >&2
+  exit 2
+fi
+
+if [[ "${DIMOS_MODE:-}" == "real" ]]; then
+  echo "Checking Go2 ${ROBOT_IP:-} WebRTC/DDS before starting DimOS..."
+  "$ROOT/.venv/bin/python" "$ROOT/../robot_agent/preflight_go2.py" || exit $?
+fi
+
+dimos_aarch64_preload
+dimos_global_args || exit $?
+dimos_aes_args
+dimos_viewer_args
 
 finish() {
   local exit_code=$?
   trap - INT TERM
   trap - EXIT
-  if [[ ! -f "$DB" ]]; then
-    echo "No recording found at $DB; skipping export." >&2
-    return "$exit_code"
+  # Export is owned by robot_agent stop_mapping (async) so SIGINT can return quickly
+  # and large PGO jobs do not block the shell EXIT trap under killpg.
+  if [[ -f "$DB" ]]; then
+    echo "Recording stopped (exit $exit_code). DB kept at $DB; agent will run export_map.sh."
+  else
+    echo "No recording found at $DB; nothing to export." >&2
   fi
-  if [[ "$exit_code" != "0" && "$exit_code" != "130" && "$exit_code" != "143" ]]; then
-    echo "Mapping process exited with code $exit_code; preserving the DB without automatic export." >&2
-    return "$exit_code"
-  fi
-  echo
-  echo "Recording stopped. Building optimized map..."
-  "$ROOT/export_map.sh" "$DB" "$MAP"
-  echo "Map saved: $MAP"
   return "$exit_code"
 }
 trap finish EXIT
 
 cd "$ROOT"
-echo "Mapping $NAME ($MODE). Drive from http://127.0.0.1:7779/; press Ctrl+C when coverage is complete."
-"$DIMOS" "${GLOBAL_ARGS[@]}" --rerun-open web run unitree-go2-memory \
-  --disable cost-mapper \
+echo "Mapping $NAME ($MODE). DimOS will StandUp the Go2, then open Command Center on port 7779."
+echo "Drive from Command Center; press Ctrl+C / 结束采集 when coverage is complete."
+# Keep live costmap (Command Center) + voxel map. Disable heavy planners only.
+# pgo-voxel-mapper needs gtsam (installed on Orin); export_map.sh still does full offline PGO.
+"$DIMOS" "${DIMOS_GLOBAL_ARGS[@]}" run \
   --disable replanning-a-star-planner \
   --disable patrolling-module \
   --disable wavefront-frontier-explorer \
-  -o "go2memory.db_path=$DB"
+  unitree-go2-memory \
+  "${DIMOS_VIEWER_ARGS[@]}" \
+  "${DIMOS_AES_ARGS[@]}" \
+  --go2memory.db-path "$DB"

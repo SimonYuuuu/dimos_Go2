@@ -14,3 +14,12 @@ logs/*.log
 logs/*.jsonl
 logs/*.json
 remote_client/data/
+robot_data/*.stdout
+robot_data/*.log
+# Host-side accidental copies / fetch noise
+/console.html
+/console.py
+/wget-log
+/ssh.md
+# Vendored native libs on Orin (not for git)
+simulation_legacy/.local-libs/

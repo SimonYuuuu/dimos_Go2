@@ -2,12 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/dimos_cli.sh"
 DIMOS="$ROOT/.venv/bin/dimos"
 ROUTE="${1:-$ROOT/patrol_route.json}"
 MAP="${2:-$ROOT/maps/warehouse.pc2.lcm}"
 MODE="${DIMOS_MODE:-simulation}"
-GLOBAL_ARGS=()
-RELOCALIZATION_ARGS=(-o "relocalizationmodule.map_file=$MAP" -o relocalizationmodule.publish_loaded_map=true)
+PATROL_BLUEPRINT="${DIMOS_PATROL_BLUEPRINT:-unitree-go2-nav-3d-relocalization}"
+RELOCALIZATION_ARGS=(--localmaprelocalization.map-file "$MAP" --localmaprelocalization.republish-loaded-map 30)
 STATUS_FILE="${PATROL_STATUS_FILE:-$ROOT/maps/patrol-status.json}"
 TRANSFORM_FILE="${PATROL_TRANSFORM_FILE:-$ROOT/maps/map-to-world.json}"
 CONTROL_FILE="${PATROL_CONTROL_FILE:-$ROOT/maps/patrol-control.json}"
@@ -17,30 +19,18 @@ STOPPING=0
 
 mkdir -p "$ROOT/logs" "$(dirname "$STATUS_FILE")"
 
-case "$MODE" in
-  simulation)
-    GLOBAL_ARGS+=(--simulation mujoco)
-    RELOCALIZATION_ARGS+=(-o relocalizationmodule.initial_pose=identity -o relocalizationmodule.min_local_points=8000)
-    ;;
-  real)
-    if [[ -z "${ROBOT_IP:-}" ]]; then
-      echo "Set ROBOT_IP to the Go2 address before starting a real patrol." >&2
-      exit 2
-    fi
-    GLOBAL_ARGS+=(--robot-ip "$ROBOT_IP")
-    if [[ -n "${UNITREE_AES_128_KEY:-}" ]]; then
-      GLOBAL_ARGS+=(--unitree-aes-128-key "$UNITREE_AES_128_KEY")
-    fi
-    if [[ -n "${DIMOS_INITIAL_POSE:-}" ]]; then
-      RELOCALIZATION_ARGS+=(-o "relocalizationmodule.initial_pose=$DIMOS_INITIAL_POSE")
-    fi
-    RELOCALIZATION_ARGS+=(-o "relocalizationmodule.min_local_points=${DIMOS_MIN_LOCAL_POINTS:-50000}")
-    ;;
-  *)
-    echo "DIMOS_MODE must be 'simulation' or 'real'." >&2
-    exit 2
-    ;;
-esac
+dimos_aarch64_preload
+dimos_global_args || exit $?
+dimos_aes_args
+dimos_viewer_args
+if [[ "$MODE" == "simulation" ]]; then
+  RELOCALIZATION_ARGS+=(--localmaprelocalization.min-local-points 8000)
+else
+  if [[ -n "${DIMOS_INITIAL_POSE:-}" ]]; then
+    RELOCALIZATION_ARGS+=(--localmaprelocalization.initial-pose "$DIMOS_INITIAL_POSE")
+  fi
+  RELOCALIZATION_ARGS+=(--localmaprelocalization.min-local-points "${DIMOS_MIN_LOCAL_POINTS:-20000}")
+fi
 
 if [[ ! -f "$ROUTE" ]]; then
   echo "Route file not found: $ROUTE" >&2
@@ -103,9 +93,12 @@ trap 'exit 143' TERM
 
 echo "Starting $MODE localization for map $MAP"
 printf '{"phase":"localizing","message":"Loading map and waiting for a valid localization match"}\n' > "$STATUS_FILE"
-"$DIMOS" "${GLOBAL_ARGS[@]}" --rerun-open web run unitree-go2-relocalization \
-  "${RELOCALIZATION_ARGS[@]}" -o "relocalizationmodule.transform_file=$TRANSFORM_FILE" \
-  --disable patrolling-module --disable wavefront-frontier-explorer >"$LOG_FILE" 2>&1 &
+"$DIMOS" "${DIMOS_GLOBAL_ARGS[@]}" run \
+  --disable patrolling-module --disable wavefront-frontier-explorer \
+  "$PATROL_BLUEPRINT" \
+  "${DIMOS_VIEWER_ARGS[@]}" \
+  "${DIMOS_AES_ARGS[@]}" \
+  "${RELOCALIZATION_ARGS[@]}" >"$LOG_FILE" 2>&1 &
 DIMOS_PID=$!
 
 echo "Waiting for map and localization. UI: http://127.0.0.1:7779/"
