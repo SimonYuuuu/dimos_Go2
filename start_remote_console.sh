@@ -3,12 +3,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/load_env.sh"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/link_profile.sh"
+
+dimos_parse_link_args "$@"
+if [[ ${#DIMOS_PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
+  echo "Unexpected arguments: ${DIMOS_PASSTHROUGH_ARGS[*]}" >&2
+  echo "Usage: ./start_remote_console.sh [--link wire|guest|dog_ap]" >&2
+  exit 2
+fi
+
 _dimos_load_env "$ROOT/.env" "$ROOT/remote_client/.env"
 
-ORIN_SSH_TARGET="${ORIN_SSH_TARGET:-go2-orin}"
-ORIN_AGENT_HOST="${ORIN_AGENT_HOST:-192.168.123.18}"
-ORIN_AGENT_PORT="${ORIN_AGENT_PORT:-8787}"
-export ROBOT_AGENT_URL="${ROBOT_AGENT_URL:-http://${ORIN_AGENT_HOST}:${ORIN_AGENT_PORT}}"
+LINK_PROFILE="${LINK_CLI:-${LINK_PROFILE:-wire}}"
+dimos_apply_link_profile "$LINK_PROFILE"
+dimos_ensure_link_ssh_aliases
 
 # Prefer ports that do NOT collide with VS Code Remote-SSH (it often grabs 7779/9877/9878/3030).
 LOCAL_CC_PORT="${LOCAL_CC_PORT:-17779}"
@@ -23,8 +32,12 @@ export no_proxy="$NO_PROXY"
 
 if [[ -z "${ROBOT_AGENT_TOKEN:-}" ]]; then
   echo "Missing ROBOT_AGENT_TOKEN. Run: ./scripts/bootstrap.sh --role host" >&2
-  echo "If Orin is already set up: ./scripts/bootstrap.sh --role host --pull-token-from go2-orin" >&2
+  echo "If Orin is already set up: ./scripts/bootstrap.sh --role host --pull-token-from ${ORIN_SSH_TARGET}" >&2
   exit 2
+fi
+
+if ! dimos_preflight_link "$ORIN_AGENT_HOST" "$ORIN_SSH_TARGET" "$ORIN_AGENT_PORT"; then
+  exit 1
 fi
 
 port_listener_cmd() {
@@ -96,13 +109,6 @@ ensure_local_forward LOCAL_RERUN_WS_PORT 3030 13030 23030 || true
 # Always use host-local tunnel ports (VS Code often owns 7779/9877/9878).
 export ROBOT_COMMAND_CENTER_URL="http://127.0.0.1:${LOCAL_CC_PORT}/command-center"
 export ROBOT_RERUN_URL="http://127.0.0.1:${LOCAL_RERUN_WEB_PORT}/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A${LOCAL_RERUN_GRPC_PORT}%2Fproxy"
-
-echo "Checking robot agent at ${ROBOT_AGENT_URL}/health ..."
-if ! curl -fsS --max-time 5 "${ROBOT_AGENT_URL}/health" >/dev/null; then
-  echo "Cannot reach ${ROBOT_AGENT_URL}/health. Confirm Orin agent is listening on 0.0.0.0:${ORIN_AGENT_PORT}." >&2
-  echo "On Orin run: cd ~/dimos_Go2 && ./start_robot_agent.sh" >&2
-  exit 1
-fi
 
 PYTHON="$ROOT/remote_client/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then

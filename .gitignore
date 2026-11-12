@@ -23,3 +23,6 @@ robot_data/*.log
 /ssh.md
 # Vendored native libs on Orin (not for git)
 simulation_legacy/.local-libs/
+# Local link-profile overrides (examples stay tracked)
+remote_client/link_profiles/*.env
+!remote_client/link_profiles/*.env.example

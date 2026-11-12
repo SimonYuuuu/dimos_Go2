@@ -76,6 +76,13 @@ ENV_ARGS=(--role "$ROLE")
 
 python3 "$ROOT/scripts/write_local_env.py" "${ENV_ARGS[@]}"
 
+# shellcheck disable=SC1091
+source "$ROOT/scripts/link_profile.sh"
+if [[ "$ROLE" == "host" || "$ROLE" == "both" ]]; then
+  dimos_seed_link_profiles
+  dimos_ensure_link_ssh_aliases
+fi
+
 ensure_ssh_alias() {
   local target="${1:-go2-orin}"
   local host="${2:-192.168.123.18}"
@@ -139,7 +146,9 @@ EOF
 if [[ "$SKIP_VENV" -eq 0 ]]; then
   if [[ "$ROLE" == "host" || "$ROLE" == "both" ]]; then
     setup_host_venv
+    # Legacy alias + link-profile aliases (wire/guest/dog_ap).
     ensure_ssh_alias "${SSH_TARGET:-go2-orin}" "${ORIN_HOST:-192.168.123.18}"
+    dimos_ensure_link_ssh_aliases
   fi
   if [[ "$ROLE" == "orin" || "$ROLE" == "both" ]]; then
     setup_orin_venv
@@ -161,8 +170,10 @@ EOF
 fi
 if [[ "$ROLE" == "host" || "$ROLE" == "both" ]]; then
   cat <<'EOF'
-  Host:  ./start_remote_console.sh
+  Host:  ./start_remote_console.sh --link wire    # Ethernet (default)
+         ./start_remote_console.sh --link guest   # after editing link_profiles/guest.env
+         ./start_remote_console.sh --link dog_ap  # join Go2 WiFi AP first
          then open http://127.0.0.1:7781/
-  Tip:   if Orin already has a token: ./scripts/bootstrap.sh --role host --pull-token-from go2-orin
+  Tip:   if Orin already has a token: ./scripts/bootstrap.sh --role host --pull-token-from go2-orin-wire
 EOF
 fi

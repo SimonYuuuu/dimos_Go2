@@ -61,7 +61,17 @@ git checkout slam_wire_test
 ./start_remote_console.sh
 ```
 
-浏览器打开 `http://127.0.0.1:7781/`。`bootstrap.sh` 会：从 `.env.example` 生成 gitignored `.env`、创建 `remote_client/.venv`、在 Orin 上准备 turbojpeg、必要时安装 DimOS、并补全 `~/.ssh/config` 里的 `go2-orin` 别名。
+浏览器打开 `http://127.0.0.1:7781/`。`bootstrap.sh` 会：从 `.env.example` 生成 gitignored `.env`、创建 `remote_client/.venv`、在 Orin 上准备 turbojpeg、必要时安装 DimOS、并补全 `~/.ssh/config` 链路别名。
+
+上位机↔Orin 链路用同一套启动脚本切换（不要另起无线入口）：
+
+```bash
+./start_remote_console.sh --link wire     # 网线 192.168.123.18（默认）
+./start_remote_console.sh --link guest    # Guest WiFi：先改 remote_client/link_profiles/guest.env 里的 Orin IP
+./start_remote_console.sh --link dog_ap   # 先连狗 AP，确认 Orin IP 后启动
+```
+
+Orin 侧始终 `./start_robot_agent.sh`（监听 `0.0.0.0:8787`）。MCU/LiDAR 仍走狗内网 `192.168.123.x`。
 
 ### 1. Orin 手动安装（可选）
 
