@@ -44,6 +44,14 @@ class RemoteAgentFireSignalTests(unittest.TestCase):
                 self.assertEqual([record["state"] for record in records], ["Fire_alarm", "Safe"])
                 self.assertTrue(all(record["timestamp"] for record in records))
 
+    def test_token_comparison_rejects_different_length_secrets(self):
+        with patch.object(agent, "TOKEN", "unit-test-token"):
+            client = agent.app.test_client()
+            denied = client.get("/api/v1/status", headers={"Authorization": "Bearer short"})
+            self.assertEqual(denied.status_code, 401)
+            health = client.get("/health")
+            self.assertEqual(health.status_code, 200)
+
     def test_invalid_alarm_state_is_rejected(self):
         with patch.object(agent, "TOKEN", "unit-test-token"):
             response = agent.app.test_client().post(

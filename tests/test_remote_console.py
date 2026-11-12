@@ -50,6 +50,7 @@ class RemoteConsoleTests(unittest.TestCase):
         response = console.app.test_client().get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"/command-center", response.data)
+        self.assertIn(b"linkStatus", response.data)
         self.assertIn("持续循环至任务时长".encode(), response.data)
         self.assertIn("火情信号：NaN".encode(), response.data)
         response.close()

@@ -143,10 +143,48 @@ def index():
     return send_file(PAGE)
 
 
+def _http_up(url: str) -> bool:
+    """True if the tunnel/target accepts HTTP (any status means the service is up)."""
+    if not url:
+        return False
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=2) as response:
+            return int(response.status) >= 200
+    except urllib.error.HTTPError as error:
+        # 4xx/5xx still means the DimOS HTTP server is listening.
+        return 400 <= int(error.code) < 600
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
+
+def _viz_unavailable(name: str, url: str):
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>"
+        f"{name} 未启动</title>"
+        "<body style='font:16px/1.45 system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem'>"
+        f"<h1>{name} 现在打不开</h1>"
+        "<p>Command Center / Rerun 必须经本机 SSH 隧道访问（127.0.0.1:7779 / 9878）。"
+        "请用 <code>./start_remote_console.sh</code> 启动调度台（脚本会自动建立隧道），"
+        "并先点「启动采图」等 DimOS 在 Orin 上监听后再打开。</p>"
+        "<p>不要直接打开 Orin 的 <code>192.168.123.18:7779/</code> 首页："
+        "DimOS 页面里的 iframe 写死了 localhost，在上位机浏览器里会变成 "
+        "「localhost refused to connect」。</p>"
+        "<p>请回到调度台点击<strong>启动采图</strong>。DimOS 连上 Go2 后会 StandUp；"
+        "周围空旷，急停握在手里。站立完成后刷新本页即可遥控。</p>"
+        f"<p>当前目标地址：<code>{url or '未配置'}</code></p>"
+        "<p><a href='/'>返回调度台</a></p>"
+        "</body>"
+    )
+    return body, 503, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.get("/command-center")
 def command_center():
     if not ROBOT_COMMAND_CENTER_URL:
-        return "Set ROBOT_COMMAND_CENTER_URL to the private-network Command Center URL.", 503
+        return _viz_unavailable("Command Center", "")
+    if not _http_up(ROBOT_COMMAND_CENTER_URL):
+        return _viz_unavailable("Command Center", ROBOT_COMMAND_CENTER_URL)
     from flask import redirect
 
     return redirect(ROBOT_COMMAND_CENTER_URL)
@@ -155,10 +193,25 @@ def command_center():
 @app.get("/rerun")
 def rerun_viewer():
     if not ROBOT_RERUN_URL:
-        return "Set ROBOT_RERUN_URL to the private-network Rerun viewer URL.", 503
+        return _viz_unavailable("Rerun", "")
+    if not _http_up(ROBOT_RERUN_URL):
+        return _viz_unavailable("Rerun", ROBOT_RERUN_URL)
     from flask import redirect
 
     return redirect(ROBOT_RERUN_URL)
+
+
+@app.get("/api/health")
+def health():
+    if not ROBOT_URL:
+        return jsonify(ok=False, error="ROBOT_AGENT_URL is not set."), 503
+    req = urllib.request.Request(f"{ROBOT_URL}/health", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            payload = json.loads(response.read() or b"{}")
+        return jsonify(ok=True, agent=payload, robot_agent_url=ROBOT_URL)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        return jsonify(ok=False, error=str(error), robot_agent_url=ROBOT_URL), 502
 
 
 @app.get("/api/status")
@@ -167,7 +220,7 @@ def status():
     _start_sync_thread()
     result, code = _agent("status")
     if code != 200:
-        return jsonify(error=result.get("error", "Robot agent unavailable.")), code
+        return jsonify(error=result.get("error", "Robot agent unavailable."), robot_agent_url=ROBOT_URL), code
     now = time.time()
     if now - last_status_log >= 15:
         _append_jsonl(LOGS / "robot-status.jsonl", [{"received_at": now, **result}])
@@ -234,7 +287,8 @@ def start_mapping():
 
 @app.post("/api/mapping/stop")
 def stop_mapping():
-    result, code = _agent("mapping/stop", "POST", {})
+    # Agent waits for DimOS SIGINT / dimos stop; export may continue async.
+    result, code = _agent("mapping/stop", "POST", {}, timeout=120.0)
     return jsonify(result), code
 
 
