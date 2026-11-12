@@ -16,7 +16,7 @@ fi
 unset UNITREE_AES_128_KEY || true
 
 if [[ -z "${ROBOT_AGENT_TOKEN:-}" ]]; then
-  echo "Set ROBOT_AGENT_TOKEN in robot_agent/.env; do not commit it." >&2
+  echo "Missing ROBOT_AGENT_TOKEN. Run: ./scripts/bootstrap.sh --role orin" >&2
   exit 2
 fi
 if [[ -z "${ROBOT_IP:-}" ]]; then
@@ -27,6 +27,7 @@ fi
 PYTHON="$ROOT/simulation_legacy/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
   echo "Missing DimOS venv at $PYTHON" >&2
+  echo "Run: ./scripts/bootstrap.sh --role orin --install-dimos" >&2
   exit 2
 fi
 

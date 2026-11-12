@@ -39,51 +39,59 @@ python3 -m venv .venv
 
 真机由 **Orin 本机 agent** 独占控制；远程机只调用代理 API。两台机器先加入可信的同一私网/VPN，配置稳定地址。HTTP API 使用共享 bearer token；生产网络请加 HTTPS（反向代理或 VPN），不允许将未加密服务直接暴露公网。共享 token 只通过环境变量/服务管理器注入，绝不可提交到 Git。
 
-### 1. Orin 安装与启动（设备到货后执行）
+### 0. 拉取后一键配置（推荐）
 
-在 Orin 上安装本项目，确认 `ROBOT_IP` 能访问 Go2，并构建与 Orin/Python/固件匹配的 DimOS 虚拟环境：
+`*.env`、DimOS/venv、turbojpeg 等运行时文件不进 Git。clone/`git pull` 后在对应机器执行：
+
+```bash
+# Orin（狗上）
+cd ~/dimos_Go2
+git checkout slam_wire_test   # 或你的工作分支
+./scripts/bootstrap.sh --role orin
+# 若尚无 DimOS 虚拟环境且 Orin 能上网：
+# ./scripts/bootstrap.sh --role orin --install-dimos
+./start_robot_agent.sh
+
+# 上位机
+cd ~/dimos_Go2
+git checkout slam_wire_test
+./scripts/bootstrap.sh --role host
+# 与 Orin 已有 token 对齐（需 SSH 通）：
+# ./scripts/bootstrap.sh --role host --pull-token-from go2-orin
+./start_remote_console.sh
+```
+
+浏览器打开 `http://127.0.0.1:7781/`。`bootstrap.sh` 会：从 `.env.example` 生成 gitignored `.env`、创建 `remote_client/.venv`、在 Orin 上准备 turbojpeg、必要时安装 DimOS、并补全 `~/.ssh/config` 里的 `go2-orin` 别名。
+
+### 1. Orin 手动安装（可选）
+
+若不用 `--install-dimos`，可自行构建与 Orin/Python/固件匹配的 DimOS 虚拟环境：
 
 ```bash
 cd /opt/dimos_Go2/simulation_legacy
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install 'dimos[base,unitree,mapping]' Flask numpy
+.venv/bin/python -m pip install 'dimos[base,unitree,mapping]' Flask numpy PyYAML
 ```
 
-使用 systemd 或受控 shell 设置 `ROBOT_AGENT_TOKEN`、`ROBOT_IP`，必要时设置 `UNITREE_AES_128_KEY`；不要把凭证写入 `.env` 提交或 shell history。启动：
+Go2 固件 ≥1.1.15 需要 AES 时，在上位机运行 `scripts/fetch_go2_aes_key.sh`（写入 Orin 的 `robot_agent/.env`，勿提交）。启动：
 
 ```bash
 cd /opt/dimos_Go2
-export ROBOT_AGENT_TOKEN='由运维安全注入的长随机值'
-export ROBOT_IP='Go2 私网 IP'
-export UNITREE_AES_128_KEY='仅当固件要求时，由安全注入'
 ./start_robot_agent.sh
 ```
 
-Agent 默认监听 `0.0.0.0:8787` 以接受私网客户端请求，所有 `/api/v1/*` API 都要求 `Authorization: Bearer ...`。`/health` 仅用于存活探测。用防火墙/VPN 限制来源；生产部署应使用 TLS 终止代理并配置 systemd 自动重启、日志轮转、数据保留/磁盘限额。
+Agent 默认监听 `0.0.0.0:8787`；所有 `/api/v1/*` 需要 `Authorization: Bearer ...`。`/health` 仅用于存活探测。
 
-### 2. 远程客户端安装与启动
-
-在运维电脑部署同一个项目，安装独立 UI 环境：
-
-```bash
-cd /opt/dimos_Go2/remote_client
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-设置与 Orin 相同的 `ROBOT_AGENT_TOKEN`、`ROBOT_AGENT_URL`（例如 `https://orin-go2.private:8787`）。`ROBOT_COMMAND_CENTER_URL` 指向受 VPN/SSH 隧道保护的 Command Center；远程 UI 默认监听 localhost：
+### 2. 远程客户端手动安装（可选）
 
 ```bash
 cd /opt/dimos_Go2
-export ROBOT_AGENT_URL='https://orin-go2.private:8787'
-export ROBOT_AGENT_TOKEN='同一 bearer token，由安全注入'
-export ROBOT_COMMAND_CENTER_URL='https://orin-go2.private:7779/'
-export ROBOT_RERUN_URL='https://orin-go2.private:9878/'
+./scripts/bootstrap.sh --role host
 ./start_remote_console.sh
 ```
 
-在浏览器打开 `http://127.0.0.1:7781/`。若通过 SSH 隧道连接操作电脑，隧道应同时只转发所需 UI 和可视化端口；不要将命令中心或 Rerun 直接暴露公网。远程后台每 5 秒拉取事件/地图并归档，页面轮询当前任务状态。
+调度台会经本机 SSH 隧道打开 Command Center / Rerun（默认 `17779` / `19878`），不要把可视化端口直接暴露公网。
 
 ## 操作流程
 

@@ -22,7 +22,8 @@ export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,${ORIN_AGENT_HOST}}"
 export no_proxy="$NO_PROXY"
 
 if [[ -z "${ROBOT_AGENT_TOKEN:-}" ]]; then
-  echo "Set ROBOT_AGENT_TOKEN in remote_client/.env; it must match the Orin agent." >&2
+  echo "Missing ROBOT_AGENT_TOKEN. Run: ./scripts/bootstrap.sh --role host" >&2
+  echo "If Orin is already set up: ./scripts/bootstrap.sh --role host --pull-token-from go2-orin" >&2
   exit 2
 fi
 
@@ -106,6 +107,7 @@ fi
 PYTHON="$ROOT/remote_client/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
   echo "Missing remote-client venv at $PYTHON" >&2
+  echo "Run: ./scripts/bootstrap.sh --role host" >&2
   exit 2
 fi
 
