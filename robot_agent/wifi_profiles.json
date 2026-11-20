@@ -1,0 +1,20 @@
+{
+  "preferred": "iphone",
+  "profiles": {
+    "iphone": {
+      "label": "iPhone 热点（调试首选）",
+      "nm_name": "iphone-hotspot",
+      "priority": 120
+    },
+    "warehouse": {
+      "label": "仓库工业 AP（后续切换）",
+      "nm_name": "warehouse",
+      "priority": 100
+    },
+    "zfguest": {
+      "label": "ZF Guest（隔离、不便 SSH，仅保底上网）",
+      "nm_name": "ZFGUEST",
+      "priority": 10
+    }
+  }
+}

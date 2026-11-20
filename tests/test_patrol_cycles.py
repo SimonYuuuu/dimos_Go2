@@ -26,15 +26,15 @@ class FakeTransport:
 
     def subscribe(self, callback):
         self.callbacks.append(callback)
-        if self.topic == "/global_costmap" and FakeTransport.costmap_available:
+        if self.topic == "global_costmap" and FakeTransport.costmap_available:
             callback(SimpleNamespace(width=10, height=10, grid=SimpleNamespace(size=100)))
         return callback
 
     def broadcast(self, _channel, message):
-        if self.topic == "/goal_request":
+        if self.topic == "goal_request":
             position = message.position
             FakeTransport.goals.append((round(float(position.x), 2), round(float(position.y), 2)))
-            for callback in FakeTransport.instances["/goal_reached"].callbacks:
+            for callback in FakeTransport.instances["goal_reached"].callbacks:
                 callback(Bool(data=True))
 
 
@@ -47,7 +47,7 @@ class PatrolCycleTests(unittest.TestCase):
             control = Path(temp) / "control.json"
             status = Path(temp) / "status.json"
             control.write_text(json.dumps({"paused": False, "stop_requested": False}))
-            with patch.object(patrol, "LCMTransport", FakeTransport), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(patrol, "make_transport", FakeTransport), contextlib.redirect_stdout(io.StringIO()):
                 patrol.run_patrol(
                     [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
                     (0.0, 0.0),

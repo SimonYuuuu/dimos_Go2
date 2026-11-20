@@ -61,6 +61,40 @@ class RemoteAgentFireSignalTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 400)
 
+    def test_map_export_requires_recording_and_writes_increment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            maps = Path(temp) / "maps"
+            maps.mkdir()
+            (maps / "floor1.db").write_bytes(b"fake-db")
+            (maps / "floor1.pc2.lcm").write_bytes(b"original")
+            with (
+                patch.object(agent, "TOKEN", "unit-test-token"),
+                patch.object(agent, "MAPS", maps),
+                patch.object(agent, "_export_map_async", return_value=(True, "floor1_1")) as export_async,
+            ):
+                client = agent.app.test_client()
+                headers = {"Authorization": "Bearer unit-test-token"}
+                missing = client.post("/api/v1/maps/missing/export", headers=headers)
+                self.assertEqual(missing.status_code, 404)
+                ok = client.post("/api/v1/maps/floor1.pc2.lcm/export", headers=headers)
+                self.assertEqual(ok.status_code, 200)
+                body = ok.get_json()
+                self.assertEqual(body["name"], "floor1_1")
+                export_async.assert_called_once_with("floor1", force=True)
+
+    def test_next_export_stem_increments_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            maps = Path(temp) / "maps"
+            maps.mkdir()
+            (maps / "floor1.pc2.lcm").write_bytes(b"a")
+            (maps / "floor1_1.pc2.lcm").write_bytes(b"b")
+            with patch.object(agent, "MAPS", maps):
+                self.assertEqual(agent._next_export_stem("floor1"), "floor1_2")
+                self.assertEqual(agent._map_stem("floor1.pc2.lcm"), "floor1")
+                self.assertEqual(agent._recording_stem("floor1_1"), None)
+                (maps / "floor1.db").write_bytes(b"db")
+                self.assertEqual(agent._recording_stem("floor1_1"), "floor1")
+
 
 if __name__ == "__main__":
     unittest.main()

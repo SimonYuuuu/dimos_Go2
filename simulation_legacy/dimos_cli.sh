@@ -29,6 +29,9 @@ dimos_aarch64_preload() {
 
 dimos_global_args() {
   DIMOS_GLOBAL_ARGS=(--viewer rerun --listen-host "${DIMOS_LISTEN_HOST:-0.0.0.0}")
+  # Keep DimOS on zenoh (default). waypoint_patrol.py uses ZenohTransport to match.
+  # LCM needs `sudo ip link set lo multicast on` on Orin and was failing without tty sudo.
+  DIMOS_GLOBAL_ARGS+=(--transport "${DIMOS_TRANSPORT:-zenoh}")
   case "${DIMOS_MODE:-simulation}" in
     simulation)
       DIMOS_GLOBAL_ARGS+=(--simulation mujoco)
@@ -66,11 +69,35 @@ dimos_viewer_args() {
   # The host console opens the correct tunnel URLs once viz ports are up.
   local advertise="${DIMOS_RERUN_ADVERTISE_HOST:-${ORIN_AGENT_HOST:-192.168.123.18}}"
   local rerun_connect="${DIMOS_RERUN_CONNECT_URL:-rerun+http://${advertise}:9877/proxy}"
+  # max_hz: only values >0 drop samples. Pose/tf are omitted, so every odom update is sent.
+  # DIMOS_RERUN_TRACK=1 (default) keeps lidar, the path, and the obstacle map.
+  # DIMOS_RERUN_LITE=1 is the optional low-rate mode when TRACK is off (mapping).
+  local max_hz memory
+  memory="${DIMOS_RERUN_MEMORY_LIMIT:-64MB}"
+  case "${DIMOS_RERUN_TRACK:-1}" in
+    0|false|FALSE|no|NO)
+      case "${DIMOS_RERUN_LITE:-0}" in
+        1|true|TRUE|yes|YES)
+          max_hz='{"world/lidar":0.5,"world/color_image":0.2,"world/global_map":0.1,"world/global_costmap":0.2}'
+          ;;
+        *)
+          max_hz='{"world/lidar":2,"world/color_image":1,"world/global_map":0.5,"world/global_costmap":0.5}'
+          ;;
+      esac
+      ;;
+    *)
+      # Path is tiny, so it is not capped. Lidar and the costmap stay light so the pose is not stuck behind them.
+      max_hz='{"world/lidar":8,"world/color_image":1,"world/global_costmap":1,"world/navigation_costmap":1}'
+      ;;
+  esac
+  max_hz="${DIMOS_RERUN_MAX_HZ:-$max_hz}"
   DIMOS_VIEWER_ARGS=(
     websocket-vis-module
     --websocketvismodule.open-browser false
     --rerunbridgemodule.rerun-open none
     --rerunbridgemodule.rerun-web true
     --rerunbridgemodule.connect-url "$rerun_connect"
+    --rerunbridgemodule.max-hz "$max_hz"
+    --rerunbridgemodule.memory-limit "$memory"
   )
 }

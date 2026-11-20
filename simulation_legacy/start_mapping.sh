@@ -2,6 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pick up Orin agent .env (e.g. DIMOS_RERUN_LITE) even if agent was started earlier.
+if [[ -f "$ROOT/../robot_agent/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/../robot_agent/.env"
+  set +a
+fi
 # shellcheck disable=SC1091
 source "$ROOT/dimos_cli.sh"
 DIMOS="$ROOT/.venv/bin/dimos"
@@ -33,6 +40,8 @@ if [[ "${DIMOS_MODE:-}" == "real" ]]; then
   "$ROOT/.venv/bin/python" "$ROOT/../robot_agent/preflight_go2.py" || exit $?
 fi
 
+# Mapping still wants the accumulating cloud and the camera. Patrol leaves this on.
+export DIMOS_RERUN_TRACK=0
 dimos_aarch64_preload
 dimos_global_args || exit $?
 dimos_aes_args

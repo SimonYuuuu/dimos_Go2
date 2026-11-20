@@ -19,11 +19,13 @@ LINK_PROFILE="${LINK_CLI:-${LINK_PROFILE:-wire}}"
 dimos_apply_link_profile "$LINK_PROFILE"
 dimos_ensure_link_ssh_aliases
 
-# Prefer ports that do NOT collide with VS Code Remote-SSH (it often grabs 7779/9877/9878/3030).
-LOCAL_CC_PORT="${LOCAL_CC_PORT:-17779}"
-LOCAL_RERUN_WEB_PORT="${LOCAL_RERUN_WEB_PORT:-19878}"
-LOCAL_RERUN_GRPC_PORT="${LOCAL_RERUN_GRPC_PORT:-19877}"
-LOCAL_RERUN_WS_PORT="${LOCAL_RERUN_WS_PORT:-13030}"
+# Command Center hardcodes ws://localhost:7779 — local forward MUST be 7779 when possible.
+# Rerun web works with alternate ports if ?url= points at the matching local gRPC forward.
+# Fallbacks avoid VS Code Remote-SSH collisions on 7779/9877/9878/3030.
+LOCAL_CC_PORT="${LOCAL_CC_PORT:-7779}"
+LOCAL_RERUN_WEB_PORT="${LOCAL_RERUN_WEB_PORT:-9878}"
+LOCAL_RERUN_GRPC_PORT="${LOCAL_RERUN_GRPC_PORT:-9877}"
+LOCAL_RERUN_WS_PORT="${LOCAL_RERUN_WS_PORT:-3030}"
 
 export REMOTE_CONSOLE_HOST="${REMOTE_CONSOLE_HOST:-127.0.0.1}"
 export REMOTE_CONSOLE_PORT="${REMOTE_CONSOLE_PORT:-7781}"
@@ -106,9 +108,24 @@ ensure_local_forward LOCAL_RERUN_WEB_PORT 9878 19878 29878
 ensure_local_forward LOCAL_RERUN_GRPC_PORT 9877 19877 29877
 ensure_local_forward LOCAL_RERUN_WS_PORT 3030 13030 23030 || true
 
-# Always use host-local tunnel ports (VS Code often owns 7779/9877/9878).
+if [[ "$LOCAL_CC_PORT" != "7779" ]]; then
+  echo "WARN: Command Center tunnel is on ${LOCAL_CC_PORT}, but the page hardcodes ws://localhost:7779." >&2
+  echo "      Free local 7779 (often VS Code port-forward) and restart, or CC will look empty." >&2
+fi
+
+# Command Center keeps host-local tunnel (needs ws://localhost:7779).
 export ROBOT_COMMAND_CENTER_URL="http://127.0.0.1:${LOCAL_CC_PORT}/command-center"
-export ROBOT_RERUN_URL="http://127.0.0.1:${LOCAL_RERUN_WEB_PORT}/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A${LOCAL_RERUN_GRPC_PORT}%2Fproxy"
+
+# Rerun gRPC CORS only allows Origin http://127.0.0.1:<web-port> (not raw Orin LAN/WiFi IPs).
+# Tunnel web+gRPC locally; serve the web UI through the console cache proxy so the ~40MB
+# wasm is fetched once on the host (Orin's clock is often wrong and defeats browser cache).
+export ROBOT_RERUN_WEB_ORIGIN="http://127.0.0.1:${LOCAL_RERUN_WEB_PORT}"
+export ROBOT_RERUN_URL="http://127.0.0.1:${REMOTE_CONSOLE_PORT}/rerun-viewer/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A${LOCAL_RERUN_GRPC_PORT}%2Fproxy"
+echo "Rerun: console cache proxy → ${ROBOT_RERUN_URL}"
+echo "      First load caches re_viewer_bg.wasm under remote_client/data/rerun_web_cache/."
+if [[ "${LINK_PROFILE}" == "iphone" || "${LINK_PROFILE}" == "guest" || "${LINK_PROFILE}" == "dog_ap" ]]; then
+  echo "      Wireless: streams follow the link bandwidth (no fixed rate cap unless DIMOS_RERUN_LITE=1)."
+fi
 
 PYTHON="$ROOT/remote_client/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
@@ -120,4 +137,22 @@ fi
 echo "Remote console on http://${REMOTE_CONSOLE_HOST}:${REMOTE_CONSOLE_PORT}/"
 echo "Command Center: ${ROBOT_COMMAND_CENTER_URL}"
 echo "Rerun:          ${ROBOT_RERUN_URL}"
+
+# Push host UTC to Orin so Rerun cache / TLS work even before NTP is online.
+if [[ -n "${ROBOT_AGENT_TOKEN:-}" && -n "${ORIN_AGENT_HOST:-}" ]]; then
+  _epoch="$(date -u +%s)"
+  _agent_base="http://${ORIN_AGENT_HOST}:${ORIN_AGENT_PORT:-8787}"
+  if curl -fsS --max-time 8 \
+    -H "Authorization: Bearer ${ROBOT_AGENT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"epoch\":${_epoch}}" \
+    "${_agent_base}/api/v1/time/sync" >/tmp/dimos-time-sync.json 2>/tmp/dimos-time-sync.err; then
+    echo "Orin clock sync: $(tr '\n' ' ' </tmp/dimos-time-sync.json)"
+  else
+    echo "WARN: Orin clock sync skipped (install timesync on Orin, or agent down)."
+    echo "      sudo ./scripts/orin_timesync.sh install"
+    [[ -s /tmp/dimos-time-sync.err ]] && sed -n '1,3p' /tmp/dimos-time-sync.err >&2 || true
+  fi
+fi
+
 exec "$PYTHON" "$ROOT/remote_client/console.py"

@@ -1,5 +1,5 @@
 # Link profile helpers for host↔Orin. Sourced by start_remote_console.sh / bootstrap.
-# Profiles: wire (default) | guest | dog_ap
+# Profiles: wire (default) | iphone | guest | dog_ap | warehouse(later via wifi add)
 
 _dimos_link_profiles_dir() {
   echo "${ROOT}/remote_client/link_profiles"
@@ -9,13 +9,13 @@ dimos_seed_link_profiles() {
   local dir profile src dst
   dir="$(_dimos_link_profiles_dir)"
   mkdir -p "$dir"
-  for profile in wire guest dog_ap; do
+  for profile in wire iphone guest dog_ap; do
     src="${dir}/${profile}.env.example"
     dst="${dir}/${profile}.env"
     if [[ -f "$src" && ! -f "$dst" ]]; then
       cp "$src" "$dst"
       chmod 600 "$dst" 2>/dev/null || true
-      echo "Seeded ${dst} from example (edit IPs for guest/dog_ap as needed)."
+      echo "Seeded ${dst} from example (edit IPs for iphone/guest/dog_ap as needed)."
     fi
   done
 }
@@ -54,7 +54,7 @@ dimos_ensure_link_ssh_aliases() {
   local dir profile host target
   dir="$(_dimos_link_profiles_dir)"
 
-  for profile in wire guest dog_ap; do
+  for profile in wire iphone guest dog_ap; do
     host=""
     target=""
     if [[ -f "${dir}/${profile}.env" ]]; then
@@ -92,11 +92,12 @@ dimos_parse_link_args() {
         ;;
       -h|--help)
         cat <<'EOF'
-Usage: ./start_remote_console.sh [--link wire|guest|dog_ap]
+Usage: ./start_remote_console.sh [--link wire|iphone|guest|dog_ap]
 
   --link   Host↔Orin path (default: LINK_PROFILE in remote_client/.env, else wire)
            wire    = Ethernet 192.168.123.18
-           guest   = ZF/warehouse guest WiFi (edit link_profiles/guest.env)
+           iphone  = iPhone hotspot (调试首选；双方都连手机热点)
+           guest   = ZF guest WiFi (常隔离 SSH，不推荐调试)
            dog_ap  = Go2 body WiFi AP (near range)
 
 Edit IPs in remote_client/link_profiles/<name>.env (seeded from *.env.example).
@@ -115,9 +116,9 @@ dimos_apply_link_profile() {
   local profile="${1:-wire}"
   local dir file
   case "$profile" in
-    wire|guest|dog_ap) ;;
+    wire|iphone|guest|dog_ap) ;;
     *)
-      echo "Unknown link profile '${profile}'. Use wire|guest|dog_ap." >&2
+      echo "Unknown link profile '${profile}'. Use wire|iphone|guest|dog_ap." >&2
       return 2
       ;;
   esac
@@ -167,8 +168,11 @@ dimos_preflight_link() {
   if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$ssh_target" "true" 2>/dev/null; then
     echo "Cannot SSH to ${ssh_target} (${host})." >&2
     case "${LINK_PROFILE:-}" in
+      iphone)
+        echo "iPhone tip: host and Orin must both join the hotspot; Orin DHCP IP may change — update link_profiles/iphone.env ORIN_AGENT_HOST." >&2
+        ;;
       guest)
-        echo "Guest WiFi tip: client isolation often blocks host↔Orin. Need IT allow-list or a non-guest SSID." >&2
+        echo "Guest WiFi tip: client isolation often blocks host↔Orin SSH. Prefer --link iphone for debug." >&2
         ;;
       dog_ap)
         echo "Dog AP tip: join Go2 WiFi first; confirm Orin IP (often still 192.168.123.18) with ping/ip." >&2

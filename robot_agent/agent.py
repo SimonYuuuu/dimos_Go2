@@ -25,9 +25,16 @@ ROUTES = PROJECT / "robot_data" / "routes"
 DATA = PROJECT / "robot_data"
 STATUS_FILE = DATA / "patrol-status.json"
 CONTROL_FILE = DATA / "patrol-control.json"
+NUDGE_FILE = DATA / "pose-nudge.json"
+DOG_POSE_FILE = DATA / "dog-pose.json"
 EVENTS_FILE = DATA / "fire-alarm-events.jsonl"
 MAPPING_LOG = DATA / "mapping.log"
 PATROL_LOG = DATA / "patrol.log"
+PATROL_DIMOS_LOG = DATA / "patrol-dimos.log"
+_RELOC_LOG_RE = re.compile(
+    r"provisional TF|relocalize settle|relocalize fix|placed, no further|Initial pose hint",
+    re.I,
+)
 TOKEN = os.environ.get("ROBOT_AGENT_TOKEN", "")
 ROBOT_IP = os.environ.get("ROBOT_IP", "")
 LIDAR_IP = os.environ.get("LIDAR_IP", "192.168.123.20")
@@ -42,7 +49,13 @@ mapping_name: str | None = None
 patrol_proc: subprocess.Popen[bytes] | None = None
 _reachability: dict[str, Any] = {"checked_at": 0.0}
 _export_lock = threading.Lock()
-_export_status: dict[str, Any] = {"name": None, "running": False, "error": None, "path": None}
+_export_status: dict[str, Any] = {
+    "name": None,
+    "recording": None,
+    "running": False,
+    "error": None,
+    "path": None,
+}
 
 DATA.mkdir(parents=True, exist_ok=True)
 ROUTES.mkdir(parents=True, exist_ok=True)
@@ -70,6 +83,17 @@ def _tail(path: Path, count: int = 100) -> list[str]:
         return []
 
 
+def _reloc_log_tail(count: int = 50) -> list[str]:
+    """Key reloc lines from DimOS log (console only showed launcher patrol.log before)."""
+    hits = [line for line in _tail(PATROL_DIMOS_LOG, 800) if _RELOC_LOG_RE.search(line)]
+    return hits[-count:]
+
+
+def _patrol_log_for_ui() -> list[str]:
+    # Launcher summary + reloc progress so operators can see provisional vs locked.
+    return _tail(PATROL_LOG, 40) + _reloc_log_tail(50)
+
+
 def _running(proc: subprocess.Popen[bytes] | None) -> bool:
     return proc is not None and proc.poll() is None
 
@@ -90,21 +114,90 @@ def _dimos_stop() -> None:
         pass
 
 
-def _export_map_async(name: str) -> None:
-    db = MAPS / f"{name}.db"
-    out = MAPS / f"{name}.pc2.lcm"
+def _map_stem(value: object) -> str:
+    """Strip .pc2.lcm / .db safely (Path.stem alone leaves '.pc2' on dual extensions)."""
+    name = Path(str(value or "")).name
+    for suffix in (".pc2.lcm", ".db", ".rrd"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
+
+def _recording_stem(selected: str) -> str | None:
+    """Resolve which .db backs a selected map, stripping trailing _N export suffixes."""
+    stem = _map_stem(selected)
+    candidates = [stem]
+    cur = stem
+    while True:
+        match = re.fullmatch(r"(.+)_([0-9]+)", cur)
+        if not match:
+            break
+        cur = match.group(1)
+        candidates.append(cur)
+    for candidate in candidates:
+        if (MAPS / f"{candidate}.db").is_file():
+            return candidate
+    return None
+
+
+def _next_export_stem(recording: str) -> str:
+    """Keep recording.pc2.lcm intact; write recording_1, _2, … for new optimized exports."""
+    nums: list[int] = []
+    if (MAPS / f"{recording}.pc2.lcm").is_file():
+        nums.append(0)
+    for path in MAPS.glob(f"{recording}_*.pc2.lcm"):
+        match = re.fullmatch(rf"{re.escape(recording)}_([0-9]+)\.pc2\.lcm", path.name)
+        if match:
+            nums.append(int(match.group(1)))
+    if not nums:
+        return recording
+    return f"{recording}_{max(nums) + 1}"
+
+
+def _export_map_async(
+    recording: str,
+    *,
+    out_stem: str | None = None,
+    force: bool = True,
+) -> tuple[bool, str | None]:
+    """Run optimized PGO export: maps/<recording>.db → maps/<out_stem>.pc2.lcm.
+
+    out_stem defaults to the next free incremental name so originals are never overwritten.
+    """
+    db = MAPS / f"{recording}.db"
+    export_stem = out_stem or _next_export_stem(recording)
+    out = MAPS / f"{export_stem}.pc2.lcm"
     if not db.is_file():
         with _export_lock:
-            _export_status.update(name=name, running=False, error=f"missing {db.name}", path=None)
-        return
-    if out.is_file():
+            _export_status.update(
+                name=export_stem,
+                recording=recording,
+                running=False,
+                error=f"missing {db.name}",
+                path=None,
+            )
+        return False, None
+    if out.is_file() and not force:
         with _export_lock:
-            _export_status.update(name=name, running=False, error=None, path=str(out))
-        return
+            _export_status.update(
+                name=export_stem,
+                recording=recording,
+                running=False,
+                error=None,
+                path=str(out),
+            )
+        return False, export_stem
     with _export_lock:
-        if _export_status.get("running") and _export_status.get("name") == name:
-            return
-        _export_status.update(name=name, running=True, error=None, path=None)
+        if _export_status.get("running"):
+            return False, None
+        _export_status.update(
+            name=export_stem,
+            recording=recording,
+            running=True,
+            error=None,
+            path=None,
+        )
 
     def worker() -> None:
         try:
@@ -114,8 +207,14 @@ def _export_map_async(name: str) -> None:
                 preload = env.get("LD_PRELOAD", "")
                 if gomp not in preload.split(":"):
                     env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
+            # Localization-ready defaults (export_map.sh also has these fallbacks).
+            env.setdefault("DIMOS_MAP_VOXEL", "0.03")
+            env.setdefault("DIMOS_MAP_PGO_TOL", "0.08")
+            env.setdefault("DIMOS_MAP_DENOISE", "1")
             with MAPPING_LOG.open("ab") as log:
-                log.write(f"\n=== export_map {name} ===\n".encode())
+                log.write(
+                    f"\n=== export_map recording={recording} out={export_stem} force={force} ===\n".encode()
+                )
                 completed = subprocess.run(
                     ["bash", str(SIM_ROOT / "export_map.sh"), str(db), str(out)],
                     cwd=str(SIM_ROOT),
@@ -127,20 +226,28 @@ def _export_map_async(name: str) -> None:
             err = None if completed.returncode == 0 and out.is_file() else f"export exit {completed.returncode}"
             with _export_lock:
                 _export_status.update(
-                    name=name,
+                    name=export_stem,
+                    recording=recording,
                     running=False,
                     error=err,
                     path=str(out) if out.is_file() else None,
                 )
         except OSError as error:
             with _export_lock:
-                _export_status.update(name=name, running=False, error=str(error), path=None)
+                _export_status.update(
+                    name=export_stem,
+                    recording=recording,
+                    running=False,
+                    error=str(error),
+                    path=None,
+                )
 
-    threading.Thread(target=worker, name=f"export-{name}", daemon=True).start()
+    threading.Thread(target=worker, name=f"export-{export_stem}", daemon=True).start()
+    return True, export_stem
 
 
 def _safe_name(value: object) -> str:
-    name = Path(str(value or "")).name
+    name = _map_stem(value)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("Name must use only letters, digits, underscores, and hyphens.")
     return name
@@ -180,12 +287,45 @@ def _ping(ip: str) -> bool | None:
         return None
 
 
+def _orin_ipv4_addrs() -> list[dict[str, str]]:
+    """Local Orin addresses (host↔Orin WiFi vs dog internal LAN)."""
+    rows: list[dict[str, str]] = []
+    try:
+        completed = subprocess.run(
+            ["ip", "-br", "-4", "addr"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return rows
+    for line in (completed.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        iface, state = parts[0], parts[1]
+        if iface in ("lo", "docker0", "dummy0") or state == "DOWN":
+            continue
+        for token in parts[2:]:
+            ip = token.split("/", 1)[0]
+            if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+                continue
+            role = "dog_lan" if ip.startswith("192.168.123.") else "host_link"
+            rows.append({"iface": iface, "ip": ip, "role": role})
+    return rows
+
+
 def _connectivity() -> dict[str, Any]:
     now = time.time()
     cached = _reachability
     if now - float(cached.get("checked_at") or 0) < 8:
         return {k: v for k, v in cached.items() if k != "checked_at"}
+    orin_addrs = _orin_ipv4_addrs()
+    host_link = next((r for r in orin_addrs if r["role"] == "host_link"), None)
+    dog_lan = next((r for r in orin_addrs if r["role"] == "dog_lan"), None)
     snapshot = {
+        # Go2 MCU address on the dog's internal LAN (Orin eth*). Not the host WiFi IP.
         "robot_ip": ROBOT_IP,
         "robot_reachable": _ping(ROBOT_IP),
         "lidar_ip": LIDAR_IP,
@@ -195,10 +335,22 @@ def _connectivity() -> dict[str, Any]:
         "rerun": _tcp_open("127.0.0.1", 9878),
         "webrtc_signaling": bool(ROBOT_IP)
         and (_tcp_open(ROBOT_IP, 9991) or _tcp_open(ROBOT_IP, 8081)),
+        "orin_addrs": orin_addrs,
+        "orin_host_link": host_link,
+        "orin_dog_lan": dog_lan,
     }
     cached.clear()
     cached.update(checked_at=now, **snapshot)
     return snapshot
+
+
+def _wifi_snapshot() -> dict[str, Any]:
+    try:
+        from wifi_control import status as wifi_status
+
+        return wifi_status()
+    except Exception as error:  # Keep /status healthy even if nmcli is missing.
+        return {"error": str(error), "profiles": [], "needs_install": True}
 
 
 def _control(**updates: object) -> dict[str, Any]:
@@ -244,9 +396,80 @@ def require_agent_token():
     return None
 
 
+def _timesync_bin() -> Path:
+    installed = Path("/usr/local/sbin/dimos-orin-timesync")
+    if installed.is_file():
+        return installed
+    return PROJECT / "scripts" / "orin_timesync.sh"
+
+
+def _clock_snapshot() -> dict[str, Any]:
+    epoch = int(time.time())
+    needs_install = not Path("/usr/local/sbin/dimos-orin-timesync").is_file()
+    ntp = None
+    synced = None
+    try:
+        show = subprocess.run(
+            ["timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        lines = [ln.strip() for ln in (show.stdout or "").splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            ntp, synced = lines[0], lines[1]
+        elif len(lines) == 1:
+            ntp = lines[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        "epoch": epoch,
+        "utc": datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ntp": ntp,
+        "synchronized": synced,
+        "needs_install": needs_install,
+        "install_hint": "ssh to Orin and run: sudo ./scripts/orin_timesync.sh install",
+    }
+
+
+def _apply_host_epoch(epoch: int) -> dict[str, Any]:
+    bin_path = _timesync_bin()
+    if not bin_path.is_file():
+        return {
+            "ok": False,
+            "error": "timesync helper missing; run sudo ./scripts/orin_timesync.sh install on Orin",
+            "clock": _clock_snapshot(),
+        }
+    before = int(time.time())
+    skew = epoch - before
+    cmd = ["sudo", "-n", str(bin_path), "set-epoch", str(epoch)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"ok": False, "error": str(error), "clock": _clock_snapshot(), "skew_before_s": skew}
+    ok = proc.returncode == 0
+    return {
+        "ok": ok,
+        "skew_before_s": skew,
+        "stdout": (proc.stdout or "").strip()[-500:],
+        "stderr": (proc.stderr or "").strip()[-300:],
+        "clock": _clock_snapshot(),
+        "error": None if ok else (proc.stderr or proc.stdout or f"exit {proc.returncode}"),
+    }
+
+
 @app.get("/health")
 def health():
     return jsonify(ok=True, service="dimos-go2-robot-agent", mode=DIMOS_MODE, robot_ip=ROBOT_IP)
+
+
+def _dog_pose() -> dict | None:
+    pose = _read_json(DOG_POSE_FILE, None)
+    if not isinstance(pose, dict) or not _running(patrol_proc):
+        return None
+    pose["age_s"] = round(time.time() - float(pose.get("t", 0.0)), 1)
+    return pose
 
 
 @app.get("/api/v1/status")
@@ -262,6 +485,7 @@ def status():
             "robot_ip": ROBOT_IP,
             "online": bool(connectivity.get("robot_reachable")),
         },
+        clock=_clock_snapshot(),
         connectivity=connectivity,
         mapping={
             "running": _running(mapping_proc),
@@ -269,17 +493,32 @@ def status():
             "phase": (
                 "recording"
                 if _running(mapping_proc)
-                else ("exporting" if _export_status.get("running") else "idle")
+                else (
+                    "exporting"
+                    if _export_status.get("running")
+                    else (
+                        "map_ready"
+                        if _export_status.get("path") and not _export_status.get("error")
+                        else "idle"
+                    )
+                )
             ),
             "export": dict(_export_status),
             "log": _tail(MAPPING_LOG, 60),
         },
-        patrol={**patrol, "running": _running(patrol_proc), "log": _tail(PATROL_LOG, 80)},
+        patrol={
+            **patrol,
+            "running": _running(patrol_proc),
+            "log": _patrol_log_for_ui(),
+            "reloc_log": _reloc_log_tail(50),
+            "dog_pose": _dog_pose(),
+        },
         fire_alarm={
             "state": control.get("fire_state", "NaN"),
             "source": control.get("fire_source", "no signal connected"),
             "events": control.get("fire_events", []),
         },
+        wifi=_wifi_snapshot(),
     )
 
 
@@ -450,22 +689,48 @@ def stop_mapping():
             mapping_proc = None
 
     export_started = False
-    if name:
-        db = MAPS / f"{name}.db"
-        out = MAPS / f"{name}.pc2.lcm"
-        if out.is_file():
-            with _export_lock:
-                _export_status.update(name=name, running=False, error=None, path=str(out))
-        elif db.is_file():
-            _export_map_async(name)
-            export_started = True
+    export_name = None
+    if name and (MAPS / f"{name}.db").is_file():
+        export_started, export_name = _export_map_async(name, force=True)
 
     return jsonify(
         ok=True,
         stopped=stopped,
         name=name,
         export_started=export_started,
-        message="Mapping stopped; map optimization/export continues on the robot if needed.",
+        export_name=export_name,
+        message=(
+            f"Mapping stopped; optimized PGO export writing {export_name}.pc2.lcm on the robot."
+            if export_name
+            else "Mapping stopped; no recording found to export."
+        ),
+    )
+
+
+@app.post("/api/v1/maps/<name>/export")
+def export_map(name: str):
+    """Re-run optimized PGO export from an existing recording (.db) into a new _N file."""
+    try:
+        selected = _safe_name(name)
+    except ValueError as error:
+        return jsonify(error=str(error)), 400
+    recording = _recording_stem(selected)
+    if not recording:
+        return jsonify(error=f"Recording .db not found for {selected}."), 404
+    if _running(mapping_proc) or _running(patrol_proc):
+        return jsonify(error="Stop mapping/patrol before re-exporting a map."), 409
+    with _export_lock:
+        if _export_status.get("running"):
+            return jsonify(error="Another map export is already running."), 409
+    started, export_name = _export_map_async(recording, force=True)
+    if not started or not export_name:
+        return jsonify(error="Could not start map export (busy or missing recording)."), 409
+    return jsonify(
+        ok=True,
+        recording=recording,
+        name=export_name,
+        map=f"{export_name}.pc2.lcm",
+        message=f"Optimized PGO export started → {export_name}.pc2.lcm (original kept). Refresh when idle.",
     )
 
 
@@ -525,12 +790,23 @@ def start_patrol():
             ROBOT_IP=ROBOT_IP,
             PATROL_STATUS_FILE=str(STATUS_FILE),
             PATROL_CONTROL_FILE=str(CONTROL_FILE),
+            PATROL_TRANSFORM_FILE=str(DATA / "map-to-world.json"),
+            PATROL_NUDGE_FILE=str(NUDGE_FILE),
+            PATROL_DOG_POSE_FILE=str(DOG_POSE_FILE),
+            PATROL_DIMOS_LOG_FILE=str(DATA / "patrol-dimos.log"),
             PATROL_START_MODE=execution_mode,
             PATROL_START_AT=start_at if execution_mode == "daily" else "",
             PATROL_MAX_DURATION_S=str(max_duration_s),
             PATROL_REPEAT_INTERVAL_S=str(repeat_interval_s),
             PATROL_REPEAT_ENABLED="1" if repeat_enabled else "0",
         )
+        # Prefer explicit agent env; fall back to robot_agent/.env via start_patrol.sh.
+        if os.environ.get("PATROL_LOCALIZE_ONLY"):
+            env["PATROL_LOCALIZE_ONLY"] = os.environ["PATROL_LOCALIZE_ONLY"]
+        if os.environ.get("DIMOS_PATROL_BLUEPRINT"):
+            env["DIMOS_PATROL_BLUEPRINT"] = os.environ["DIMOS_PATROL_BLUEPRINT"]
+        if os.environ.get("DIMOS_RELOC_MODULE"):
+            env["DIMOS_RELOC_MODULE"] = os.environ["DIMOS_RELOC_MODULE"]
         if AES_KEY:
             env["GO2CONNECTION__AES_128_KEY"] = AES_KEY
         gomp = "/lib/aarch64-linux-gnu/libgomp.so.1"
@@ -538,11 +814,19 @@ def start_patrol():
             preload = env.get("LD_PRELOAD", "")
             if gomp not in preload.split(":"):
                 env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
-        if body.get("initial_pose"):
-            env["DIMOS_INITIAL_POSE"] = str(body["initial_pose"])
+        # Console value: dog pose in the loaded map frame (x, y meters, yaw radians).
+        # Same frame as the route waypoints. Not odometry, not world←map.
+        initial_pose = str(body.get("initial_pose") or "").strip()
+        if initial_pose:
+            env["DIMOS_INITIAL_POSE"] = initial_pose
+        elif os.environ.get("DIMOS_INITIAL_POSE"):
+            env["DIMOS_INITIAL_POSE"] = os.environ["DIMOS_INITIAL_POSE"]
+        elif os.environ.get("DIMOS_MODE", "real") == "real":
+            # Rectangular rooms: global ICP alone false-locks at 90°/180°.
+            env["DIMOS_INITIAL_POSE"] = "0,0,0"
         current_control = _read_json(CONTROL_FILE, {})
         current_fire = current_control.get("fire_state", "NaN") if isinstance(current_control, dict) else "NaN"
-        _control(stop_requested=False, paused=current_fire == "Fire_alarm")
+        _control(stop_requested=False, halt=False, paused=current_fire == "Fire_alarm")
         with PATROL_LOG.open("wb") as log:
             patrol_proc = subprocess.Popen(
                 ["bash", str(SIM_ROOT / "start_patrol.sh"), str(route_path), str(MAPS / map_name)],
@@ -557,10 +841,100 @@ def start_patrol():
 
 @app.post("/api/v1/patrol/stop")
 def stop_patrol():
-    if not _running(patrol_proc):
-        return jsonify(error="No patrol task is running."), 409
-    _control(paused=False, stop_requested=True)
-    return jsonify(ok=True, message="Return-home stop requested.")
+    """Stop patrol/localize. Soft-stop first (waypoint return-home), then kill the
+    process group — localize-only never runs waypoint_patrol, so control-file alone
+    would leave DimOS running forever and block the next start with 409.
+    """
+    global patrol_proc
+    with lock:
+        proc = patrol_proc
+        if not _running(proc):
+            return jsonify(error="No patrol task is running."), 409
+        _control(paused=False, stop_requested=True)
+
+    # Localize-only: no return-home; kill quickly.
+    # Full patrol: waypoint_patrol navigates to return_to_start — allow time.
+    localize_only = str(os.environ.get("PATROL_LOCALIZE_ONLY", "0")).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    grace_s = 3 if localize_only else int(os.environ.get("PATROL_STOP_GRACE_S", "180"))
+    try:
+        if proc.wait(timeout=grace_s) is not None:
+            with lock:
+                if patrol_proc is proc:
+                    patrol_proc = None
+            _write_json(STATUS_FILE, {"phase": "idle", "message": "Patrol stopped."})
+            return jsonify(ok=True, message="Patrol stopped.")
+    except subprocess.TimeoutExpired:
+        pass
+
+    _dimos_stop()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(timeout=8 if sig != signal.SIGKILL else 5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    with lock:
+        if patrol_proc is proc and not _running(proc):
+            patrol_proc = None
+    _write_json(STATUS_FILE, {"phase": "idle", "message": "Patrol/localize stopped."})
+    return jsonify(ok=True, message="Patrol/localize force-stopped.")
+
+
+def _kill_patrol_group(proc: subprocess.Popen[bytes] | None) -> None:
+    _dimos_stop()
+    if proc is not None and _running(proc):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                proc.wait(timeout=3)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    # The agent may have been restarted and lost the process handle.
+    subprocess.run(
+        ["pkill", "-f", "simulation_legacy/start_patrol.sh"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["pkill", "-f", "dimos --viewer rerun"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+@app.post("/api/v1/patrol/halt")
+def halt_patrol():
+    """Stop where it stands. Do not walk home, then drop the stack so the dog lies down."""
+    global patrol_proc
+    with lock:
+        proc = patrol_proc
+        _control(paused=False, stop_requested=True, halt=True)
+    if proc is not None and _running(proc):
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    _kill_patrol_group(proc)
+    with lock:
+        if patrol_proc is proc:
+            patrol_proc = None
+    _write_json(STATUS_FILE, {"phase": "idle", "message": "Halted in place. The dog will lie down."})
+    return jsonify(ok=True, message="Halted in place. The dog will lie down.")
 
 
 @app.post("/api/v1/patrol/pause")
@@ -581,9 +955,97 @@ def resume_patrol():
     return jsonify(ok=True, state="Safe")
 
 
+@app.post("/api/v1/patrol/confirm-pose")
+def confirm_pose():
+    """Operator verified Rerun overlap; allow start_patrol to dispatch waypoints."""
+    if not _running(patrol_proc):
+        return jsonify(error="No patrol task is running."), 409
+    _control(pose_confirmed=True)
+    return jsonify(ok=True, message="Pose confirmed; navigation may start.")
+
+
+@app.post("/api/v1/patrol/nudge-pose")
+def nudge_pose():
+    """Shift the locked dog pose on the loaded map by a small operator step."""
+    body = request.get_json(silent=True) or {}
+    try:
+        dx = float(body.get("dx", 0.0))
+        dy = float(body.get("dy", 0.0))
+        dyaw_deg = float(body.get("dyaw_deg", 0.0))
+    except (TypeError, ValueError):
+        return jsonify(error="dx, dy and dyaw_deg must be numbers."), 400
+    if not all(math.isfinite(v) for v in (dx, dy, dyaw_deg)):
+        return jsonify(error="dx, dy and dyaw_deg must be finite."), 400
+    if abs(dx) > 0.5 or abs(dy) > 0.5 or abs(dyaw_deg) > 15:
+        return jsonify(error="One step is at most 0.5 m and 15 degrees."), 400
+    current = _read_json(NUDGE_FILE, {})
+    seq = int(current.get("seq", 0)) + 1 if isinstance(current, dict) else 1
+    _write_json(NUDGE_FILE, {"seq": seq, "dx": dx, "dy": dy, "dyaw_deg": dyaw_deg})
+    return jsonify(ok=True, seq=seq)
+
+
 @app.get("/api/v1/logs")
 def logs():
-    return jsonify(mapping=_tail(MAPPING_LOG), patrol=_tail(PATROL_LOG))
+    return jsonify(
+        mapping=_tail(MAPPING_LOG),
+        patrol=_patrol_log_for_ui(),
+        reloc=_reloc_log_tail(80),
+    )
+
+
+@app.get("/api/v1/wifi")
+def wifi_status():
+    from wifi_control import status as wifi_status_fn
+
+    return jsonify(wifi_status_fn())
+
+
+@app.post("/api/v1/wifi/prefer")
+def wifi_prefer():
+    body = request.get_json(silent=True) or {}
+    profile = str(body.get("profile") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", profile or ""):
+        return jsonify(error="profile must be a simple id (letters/digits/_/-)."), 400
+    from wifi_control import prefer as wifi_prefer_fn
+
+    result = wifi_prefer_fn(profile)
+    code = 200 if result.get("ok") else 500
+    return jsonify(result), code
+
+
+@app.post("/api/v1/wifi/connect")
+def wifi_connect():
+    body = request.get_json(silent=True) or {}
+    profile = str(body.get("profile") or "").strip()
+    if profile and not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+        return jsonify(error="profile must be a simple id (letters/digits/_/-)."), 400
+    from wifi_control import connect as wifi_connect_fn
+
+    result = wifi_connect_fn(profile or None)
+    code = 200 if result.get("ok") else 500
+    return jsonify(result), code
+
+
+@app.get("/api/v1/time")
+def time_status():
+    return jsonify(ok=True, clock=_clock_snapshot())
+
+
+@app.post("/api/v1/time/sync")
+def time_sync():
+    """Accept host UTC epoch and set Orin wall clock when skew is large."""
+    body = request.get_json(silent=True) or {}
+    try:
+        epoch = int(body.get("epoch"))
+    except (TypeError, ValueError):
+        return jsonify(error="epoch must be a Unix timestamp integer"), 400
+    # Reject absurd futures (>1 day ahead of what Python thinks) only after install;
+    # before install the board clock may be years behind, so trust the host epoch.
+    if epoch < 1_600_000_000:  # before ~2020-09
+        return jsonify(error="epoch looks too old; send current host UTC seconds"), 400
+    result = _apply_host_epoch(epoch)
+    code = 200 if result.get("ok") else 503
+    return jsonify(result), code
 
 
 if __name__ == "__main__":

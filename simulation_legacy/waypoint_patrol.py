@@ -24,13 +24,29 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dimos.core.transport import LCMTransport
+from dimos.core.transport_factory import make_transport
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos_lcm.std_msgs import Bool
 
 GOAL_TIMEOUT_S = 60.0
-COSTMAP_TIMEOUT_S = 60.0
+GOAL_RESEND_S = 3.0
+GOAL_FREEZE_M = 1.5
+
+
+def dog_on_map() -> tuple[float, float] | None:
+    """The dog's live map position written by the relocalization module."""
+    path = os.environ.get("PATROL_DOG_POSE_FILE", "").strip()
+    if not path:
+        return None
+    try:
+        pose = json.loads(Path(path).read_text(encoding="utf-8"))
+        if time.time() - float(pose.get("t", 0.0)) > 3.0:
+            return None
+        return float(pose["x"]), float(pose["y"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+COSTMAP_TIMEOUT_S = 120.0
 
 
 def load_route(
@@ -69,6 +85,20 @@ def write_status(path: Path | None, **fields: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(state, indent=2) + "\n")
     temporary.replace(path)
+
+
+def transform_signature(transform_file: Path | None) -> tuple[float, float, float] | None:
+    """Coarse world<-map signature. Changes when a tracking fix should move the goal."""
+    if transform_file is None:
+        return None
+    try:
+        transform = json.loads(transform_file.read_text())
+        tx, ty, _tz = transform["translation"]
+        yaw = float(transform.get("yaw_deg", 0.0))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    # 0.4 m / 5 deg. Finer updates cancel the live goal and zero the gait.
+    return (round(float(tx) * 2.5) / 2.5, round(float(ty) * 2.5) / 2.5, round(yaw / 5.0) * 5.0)
 
 
 def map_point_to_world(
@@ -147,14 +177,18 @@ def run_patrol(
     repeat_enabled: bool = False,
 ) -> None:
     goal_reached = threading.Event()
+    goal_failed = threading.Event()
 
     def _on_goal_reached(msg: Bool) -> None:
         if msg.data:
             goal_reached.set()
+        else:
+            goal_failed.set()
 
-    goal_request = LCMTransport("/goal_request", PoseStamped)
-    reached = LCMTransport("/goal_reached", Bool)
-    stop_movement = LCMTransport("/stop_movement", Bool)
+    # Use DimOS factory so Zenoh keys are `dimos/<name>/...` (leading `/` is illegal).
+    goal_request = make_transport("goal_request", PoseStamped)
+    reached = make_transport("goal_reached", Bool)
+    stop_movement = make_transport("stop_movement", Bool)
     costmap_ready = threading.Event()
 
     def _on_global_costmap(msg: OccupancyGrid) -> None:
@@ -162,7 +196,7 @@ def run_patrol(
         if msg.width > 0 and msg.height > 0 and getattr(grid, "size", 0) > 0:
             costmap_ready.set()
 
-    global_costmap = LCMTransport("/global_costmap", OccupancyGrid)
+    global_costmap = make_transport("global_costmap", OccupancyGrid)
     reached.subscribe(_on_goal_reached)
     global_costmap.subscribe(_on_global_costmap)
 
@@ -214,6 +248,7 @@ def run_patrol(
                 return "stop"
             time.sleep(0.1)
         goal_reached.clear()
+        goal_failed.clear()
         write_status(
             status_file,
             phase=phase,
@@ -235,7 +270,10 @@ def run_patrol(
             ),
         )
         goal_deadline = time.monotonic() + GOAL_TIMEOUT_S
+        last_send = time.monotonic()
         paused = False
+        last_tf = transform_signature(transform_file)
+        last_pub = (world_x, world_y)
         while True:
             if allow_pause and read_control(control_file).get("paused"):
                 if not paused:
@@ -274,10 +312,45 @@ def run_patrol(
                 )
             if goal_reached.is_set():
                 return "reached"
+            fresh_tf = transform_signature(transform_file)
+            if fresh_tf is not None and fresh_tf != last_tf:
+                last_tf = fresh_tf
+                nx, ny = map_point_to_world(x, y, transform_file)
+                # A few centimeters of tracking noise was cancelling the stop and
+                # starting the same path again. Republish only after a real shift,
+                # and not on the final approach, where a new goal bends the path.
+                dog = dog_on_map()
+                approaching = dog is not None and math.hypot(dog[0] - x, dog[1] - y) < GOAL_FREEZE_M
+                if not approaching and math.hypot(nx - last_pub[0], ny - last_pub[1]) >= 0.4:
+                    last_pub = (nx, ny)
+                    goal_reached.clear()
+                    publish_goal(x, y)
+                    goal_deadline = time.monotonic() + GOAL_TIMEOUT_S
+                    write_status(
+                        status_file,
+                        phase=phase,
+                        cycle=cycle_number,
+                        index=index,
+                        total=total,
+                        x=x,
+                        y=y,
+                        message="Localization updated; republishing the current goal",
+                    )
+            if read_control(control_file).get("halt"):
+                stop_movement.broadcast(None, Bool(data=True))
+                return "stop"
             if allow_pause and (stop_requested() or duration_expired()):
+                stop_movement.broadcast(None, Bool(data=True))
                 return "stop"
             if not paused and time.monotonic() >= goal_deadline:
                 return "timeout"
+            # The planner drops a goal for good after "No path found"; the
+            # costmap keeps changing, so ask again.
+            if goal_failed.is_set() and time.monotonic() - last_send >= GOAL_RESEND_S:
+                goal_failed.clear()
+                last_send = time.monotonic()
+                print(f"  planner gave up on ({x}, {y}); resending goal", flush=True)
+                publish_goal(x, y)
             goal_reached.wait(timeout=0.1)
 
     def wait_dwell(seconds: float, cycle_number: int, index: int) -> bool:
@@ -315,6 +388,18 @@ def run_patrol(
         nonlocal stop_reason, failure, home_reached
         stop_reason = reason
         failure = error
+        if read_control(control_file).get("halt"):
+            stop_movement.broadcast(None, Bool(data=True))
+            write_status(
+                status_file,
+                phase="stopped",
+                cycle=cycle,
+                index=len(waypoints),
+                total=len(waypoints),
+                message="Halted in place; not returning home",
+            )
+            print("Halted in place", flush=True)
+            return
         if return_to_start is not None and navigation_ready:
             while read_control(control_file).get("paused"):
                 write_status(
@@ -447,9 +532,18 @@ def run_patrol(
                     stop_reason = "stopped" if stop_requested() else "duration"
                     break
                 if result == "timeout":
-                    failure = f"Timed out waiting to reach point {i}"
-                    stop_reason = "error"
-                    break
+                    print(f"[cycle {cycle}] [{i}/{len(waypoints)}] skipped map=({x}, {y}): no path within {GOAL_TIMEOUT_S:g}s", flush=True)
+                    write_status(
+                        status_file,
+                        phase="running",
+                        cycle=cycle,
+                        index=i,
+                        total=len(waypoints),
+                        x=x,
+                        y=y,
+                        message=f"Point {i} unreachable for {GOAL_TIMEOUT_S:g}s; skipping to the next point",
+                    )
+                    continue
                 print(
                     f"[cycle {cycle}] [{i}/{len(waypoints)}] reached map=({x}, {y})",
                     flush=True,

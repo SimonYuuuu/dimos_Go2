@@ -21,19 +21,24 @@ ROBOT_URL = os.environ.get("ROBOT_AGENT_URL", "").rstrip("/")
 ROBOT_TOKEN = os.environ.get("ROBOT_AGENT_TOKEN", "")
 ROBOT_COMMAND_CENTER_URL = os.environ.get("ROBOT_COMMAND_CENTER_URL", "")
 ROBOT_RERUN_URL = os.environ.get("ROBOT_RERUN_URL", "")
+# Origin of Orin Rerun web assets (via SSH tunnel). Used by /rerun-viewer/ cache proxy.
+ROBOT_RERUN_WEB_ORIGIN = os.environ.get("ROBOT_RERUN_WEB_ORIGIN", "http://127.0.0.1:9878").rstrip("/")
 ROUTES = PROJECT / "remote_client" / "routes"
 DATA = PROJECT / "remote_client" / "data"
 LOGS = PROJECT / "logs"
 PAGE = PROJECT / "remote_client" / "console.html"
 CURSOR_FILE = DATA / "event-cursor.json"
+RERUN_WEB_CACHE = DATA / "rerun_web_cache"
 app = Flask(__name__)
 sync_lock = threading.Lock()
 sync_started = False
 sync_start_lock = threading.Lock()
 last_status_log = 0.0
+_rerun_cache_lock = threading.Lock()
 ROUTES.mkdir(parents=True, exist_ok=True)
 DATA.mkdir(parents=True, exist_ok=True)
 LOGS.mkdir(parents=True, exist_ok=True)
+RERUN_WEB_CACHE.mkdir(parents=True, exist_ok=True)
 
 
 def _agent(path: str, method: str = "GET", payload: Any = None, timeout: float = 15.0) -> tuple[Any, int]:
@@ -190,15 +195,128 @@ def command_center():
     return redirect(ROBOT_COMMAND_CENTER_URL)
 
 
+def _rerun_cacheable(path: str) -> bool:
+    lower = path.lower()
+    return lower.endswith(
+        (
+            ".wasm",
+            ".js",
+            ".css",
+            ".html",
+            ".ttf",
+            ".woff",
+            ".woff2",
+            ".png",
+            ".ico",
+            ".svg",
+            ".json",
+        )
+    )
+
+
+def _rerun_connect_query() -> str:
+    """Keep the gRPC url that start_remote_console.sh put on ROBOT_RERUN_URL."""
+    incoming = request.query_string.decode("utf-8", errors="ignore")
+    if incoming:
+        return incoming
+    return urllib.parse.urlparse(ROBOT_RERUN_URL).query
+
+
+def _rerun_cache_file(rel_path: str) -> tuple[Path, Path, str]:
+    cache_key = rel_path.strip("/") or "index.html"
+    cache_path = RERUN_WEB_CACHE / cache_key
+    return cache_path, Path(str(cache_path) + ".ctype"), cache_key
+
+
+def _rerun_fetch_and_cache(rel_path: str) -> tuple[bytes, str] | tuple[None, None]:
+    """Serve a cached Rerun asset from disk. Fetch the tunnel only on a miss."""
+    remote = f"{ROBOT_RERUN_WEB_ORIGIN}/{rel_path.lstrip('/')}" if rel_path else f"{ROBOT_RERUN_WEB_ORIGIN}/"
+    cache_path, meta_path, cache_key = _rerun_cache_file(rel_path)
+    if _rerun_cacheable(cache_key) and cache_path.is_file() and meta_path.is_file():
+        try:
+            return cache_path.read_bytes(), meta_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    req = urllib.request.Request(remote, headers={"Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            body = response.read()
+            ctype = response.headers.get("Content-Type", "application/octet-stream")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None, None
+    if _rerun_cacheable(cache_key) and body:
+        with _rerun_cache_lock:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                tmp.write_bytes(body)
+                tmp.replace(cache_path)
+                meta_path.write_text(ctype + "\n", encoding="utf-8")
+            except OSError:
+                pass
+    return body, ctype
+
+
+def _rerun_waiting_page(target: str) -> tuple[str, int, dict[str, str]]:
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>Rerun 启动中</title>"
+        "<body style='font:16px/1.45 system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem'>"
+        "<h1>Rerun 正在起来</h1>"
+        "<p>这一页会留在这里，等 Orin 上的查看器一监听就自动进入。"
+        "查看器程序用的是本机已经缓存的文件，不用再下那 40MB。</p>"
+        f"<p><a href='{target}'>如果十几秒后还停在这里，点这里进入</a></p>"
+        "<script>setTimeout(()=>location.replace(" + json.dumps(target) + "),1500)</script>"
+        "</body>"
+    )
+    return body, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
+
+
 @app.get("/rerun")
 def rerun_viewer():
-    if not ROBOT_RERUN_URL:
-        return _viz_unavailable("Rerun", "")
-    if not _http_up(ROBOT_RERUN_URL):
-        return _viz_unavailable("Rerun", ROBOT_RERUN_URL)
+    """Open the cached viewer and keep the gRPC url on the query string."""
     from flask import redirect
 
-    return redirect(ROBOT_RERUN_URL)
+    qs = _rerun_connect_query()
+    target = "/rerun-viewer/" + (f"?{qs}" if qs else "")
+    if _http_up(ROBOT_RERUN_WEB_ORIGIN):
+        return redirect(target)
+    return _rerun_waiting_page("/rerun" + (f"?{qs}" if qs else ""))
+
+
+@app.route("/rerun-viewer/", defaults={"path": ""})
+@app.route("/rerun-viewer/<path:path>")
+def rerun_viewer_proxy(path: str):
+    """Serve Rerun's web UI from the host cache. The tunnel is used only on a miss."""
+    from flask import Response
+
+    cache_path, meta_path, cache_key = _rerun_cache_file(path)
+    cached = _rerun_cacheable(cache_key) and cache_path.is_file() and meta_path.is_file()
+    if cached:
+        try:
+            etag = f'"{cache_path.stat().st_size:x}-{int(cache_path.stat().st_mtime)}"'
+        except OSError:
+            etag = ""
+        if etag and request.headers.get("If-None-Match") == etag:
+            return Response(status=304, headers={"ETag": etag, "Cache-Control": "public, max-age=31536000, immutable"})
+    elif not _http_up(ROBOT_RERUN_WEB_ORIGIN):
+        return _viz_unavailable("Rerun", ROBOT_RERUN_WEB_ORIGIN)
+    body, ctype = _rerun_fetch_and_cache(path)
+    if body is None:
+        return _viz_unavailable("Rerun", f"{ROBOT_RERUN_WEB_ORIGIN}/{path}")
+    if (ctype or "").startswith("text/html") or cache_key.endswith(".html"):
+        text = body.decode("utf-8", errors="replace")
+        origin = ROBOT_RERUN_WEB_ORIGIN.rstrip("/")
+        text = text.replace(origin + "/", "/rerun-viewer/")
+        body = text.encode("utf-8")
+        ctype = "text/html; charset=utf-8"
+    headers = {"Content-Type": ctype or "application/octet-stream"}
+    if _rerun_cacheable(cache_key):
+        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if cached:
+            headers["ETag"] = etag
+    else:
+        headers["Cache-Control"] = "no-cache"
+    return Response(body, status=200, headers=headers)
 
 
 @app.get("/api/health")
@@ -214,14 +332,29 @@ def health():
         return jsonify(ok=False, error=str(error), robot_agent_url=ROBOT_URL), 502
 
 
+_last_clock_push = 0.0
+
+
 @app.get("/api/status")
 def status():
-    global last_status_log
+    global last_status_log, _last_clock_push
     _start_sync_thread()
     result, code = _agent("status")
     if code != 200:
         return jsonify(error=result.get("error", "Robot agent unavailable."), robot_agent_url=ROBOT_URL), code
     now = time.time()
+    # If Orin clock is skewed, push host UTC (throttled). Needs orin_timesync install.
+    clock = result.get("clock") if isinstance(result, dict) else None
+    if isinstance(clock, dict) and now - _last_clock_push >= 60:
+        try:
+            orin_epoch = int(clock.get("epoch") or 0)
+        except (TypeError, ValueError):
+            orin_epoch = 0
+        skew = abs(int(now) - orin_epoch)
+        if orin_epoch and skew >= 120:
+            sync_result, sync_code = _agent("time/sync", "POST", {"epoch": int(now)}, timeout=20.0)
+            result["clock_sync"] = {"attempted": True, "code": sync_code, "result": sync_result}
+            _last_clock_push = now
     if now - last_status_log >= 15:
         _append_jsonl(LOGS / "robot-status.jsonl", [{"received_at": now, **result}])
         last_status_log = now
@@ -287,8 +420,46 @@ def start_mapping():
 
 @app.post("/api/mapping/stop")
 def stop_mapping():
-    # Agent waits for DimOS SIGINT / dimos stop; export may continue async.
+    # Agent waits for DimOS SIGINT / dimos stop; optimized PGO export continues async.
     result, code = _agent("mapping/stop", "POST", {}, timeout=120.0)
+    return jsonify(result), code
+
+
+@app.post("/api/maps/export")
+def export_map():
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("map") or body.get("name") or "")
+    stem = Path(raw).name
+    if stem.endswith(".pc2.lcm"):
+        stem = stem[: -len(".pc2.lcm")]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", stem):
+        return jsonify(error="Select a valid map recording name."), 400
+    result, code = _agent(f"maps/{urllib.parse.quote(stem)}/export", "POST", {}, timeout=30.0)
+    return jsonify(result), code
+
+
+@app.get("/api/wifi")
+def wifi_status():
+    result, code = _agent("wifi")
+    return jsonify(result), code
+
+
+@app.post("/api/wifi/prefer")
+def wifi_prefer():
+    body = request.get_json(silent=True) or {}
+    result, code = _agent("wifi/prefer", "POST", {"profile": body.get("profile", "")}, timeout=30.0)
+    return jsonify(result), code
+
+
+@app.post("/api/wifi/connect")
+def wifi_connect():
+    body = request.get_json(silent=True) or {}
+    result, code = _agent(
+        "wifi/connect",
+        "POST",
+        {"profile": body.get("profile", "")},
+        timeout=60.0,
+    )
     return jsonify(result), code
 
 
@@ -321,6 +492,12 @@ def stop_patrol():
     return jsonify(result), code
 
 
+@app.post("/api/patrol/halt")
+def halt_patrol():
+    result, code = _agent("patrol/halt", "POST", {}, timeout=20.0)
+    return jsonify(result), code
+
+
 @app.post("/api/patrol/fire-alarm")
 def fire_alarm():
     result, code = _agent("patrol/pause", "POST", {})
@@ -335,6 +512,20 @@ def pause_patrol():
 @app.post("/api/patrol/resume")
 def resume_patrol():
     result, code = _agent("patrol/resume", "POST", {})
+    return jsonify(result), code
+
+
+@app.post("/api/patrol/confirm-pose")
+def confirm_pose():
+    result, code = _agent("patrol/confirm-pose", "POST", {})
+    return jsonify(result), code
+
+
+@app.post("/api/patrol/nudge-pose")
+def nudge_pose():
+    body = request.get_json(silent=True) or {}
+    payload = {key: body.get(key, 0) for key in ("dx", "dy", "dyaw_deg")}
+    result, code = _agent("patrol/nudge-pose", "POST", payload)
     return jsonify(result), code
 
 
