@@ -64,10 +64,29 @@ if ! "$ROOT/.venv/bin/python" -c "import gtsam" >/dev/null 2>&1; then
 fi
 # Open3D on Jetson needs libgomp preload (dimos_aarch64_preload above). Do not call bare `dimos`.
 echo "Exporting localization cloud and planning graph (voxel=${VOXEL}, pgo-tol=${PGO_TOL}, device=${DEVICE}, extras=${EXTRA_MAP_ARGS[*]:-none})..."
-"$DIMOS" map global "$DB" --pgo --export --export-pc2 --no-gui \
-  --device "$DEVICE" --voxel "$VOXEL" --pgo-tol "$PGO_TOL" \
-  "${EXTRA_MAP_ARGS[@]}" \
-  --out "$RRD"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+"$ROOT/.venv/bin/python" "$REPO_ROOT/scripts/apply_map_skip_raw_patch.py" >&2 || true
+MAP_ARGS=(--no-gui --device "$DEVICE" --voxel "$VOXEL" --pgo-tol "$PGO_TOL")
+if [[ "${DIMOS_MAP_SERIAL:-0}" == "1" ]]; then
+  "$DIMOS" map global "$DB" --pgo --export --export-pc2 "${MAP_ARGS[@]}" \
+    "${EXTRA_MAP_ARGS[@]}" \
+    --out "$RRD"
+else
+  # The cloud (.pc2.lcm) and the pose graph (.map.db) do not depend on each other: two processes.
+  # The raw preview map is not needed by either (.rrd is only a preview).
+  export DIMOS_MAP_SKIP_RAW="${DIMOS_MAP_SKIP_RAW:-1}"
+  GRAPH_RRD="$(mktemp --suffix=.rrd)"
+  "$DIMOS" map global "$DB" --export "${MAP_ARGS[@]}" --out "$GRAPH_RRD" \
+    > >(sed -u 's/^/[map.db] /') 2>&1 &
+  GRAPH_PID=$!
+  rc=0
+  "$DIMOS" map global "$DB" --pgo --export-pc2 "${MAP_ARGS[@]}" \
+    "${EXTRA_MAP_ARGS[@]}" \
+    --out "$RRD" || rc=$?
+  wait "$GRAPH_PID" || rc=$?
+  rm -f "$GRAPH_RRD"
+  [[ "$rc" -eq 0 ]] || exit "$rc"
+fi
 
 SOURCE="$ROOT/${STEM}.pc2.lcm"
 if [[ -f "$SOURCE" && "$SOURCE" != "$OUT" ]]; then

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stop a background DimOS patrol and the robot agent on this Orin.
+# Stop a background DimOS (patrol/mapping) and the robot agent on this Orin.
+# Mapping-only (keep agent): ./simulation_legacy/stop_mapping.sh
 # WebRTC drops when DimOS exits, so the dog lies down.
 set -u
 
@@ -13,6 +14,8 @@ stop_match() {
 }
 
 # The shell first, so it cannot start DimOS again after the child exits.
+stop_match '[s]tart_mapping_quality\.sh'
+stop_match '[s]tart_mapping\.sh'
 stop_match '[s]tart_patrol.sh'
 stop_match '[d]imos --viewer'
 stop_match '[d]imos run'
@@ -28,6 +31,8 @@ force_match() {
   fi
 }
 
+force_match '[s]tart_mapping_quality\.sh'
+force_match '[s]tart_mapping\.sh'
 force_match '[s]tart_patrol.sh'
 force_match '[d]imos --viewer'
 force_match '[d]imos run'
@@ -38,7 +43,7 @@ force_match 'simulation_legacy/.venv/bin/python -c from multiprocessing.forkserv
 force_match 'simulation_legacy/.venv/bin/python -c from multiprocessing.resource_tracker'
 sleep 0.5
 
-left="$(pgrep -af '[d]imos --viewer|[s]tart_patrol.sh|[/]robot_agent/agent.py|[s]tart_robot_agent.sh' || true)"
+left="$(pgrep -af '[d]imos --viewer|[s]tart_patrol.sh|[s]tart_mapping|[\/]robot_agent/agent.py|[s]tart_robot_agent.sh' || true)"
 if [[ -n "$left" ]]; then
   echo "Some processes are still running:"
   echo "$left"

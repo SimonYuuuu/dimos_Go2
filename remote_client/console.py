@@ -27,8 +27,14 @@ ROUTES = PROJECT / "remote_client" / "routes"
 DATA = PROJECT / "remote_client" / "data"
 LOGS = PROJECT / "logs"
 PAGE = PROJECT / "remote_client" / "console.html"
+MAPPING_PAGE = PROJECT / "remote_client" / "mapping.html"
 CURSOR_FILE = DATA / "event-cursor.json"
 RERUN_WEB_CACHE = DATA / "rerun_web_cache"
+# patrol = 巡检调度台 (start_remote_console.sh); mapping = 慢速建图台 (start_mapping_console.sh)
+CONSOLE_ROLE = os.environ.get("DIMOS_CONSOLE_ROLE", "patrol").strip().lower()
+if CONSOLE_ROLE not in ("patrol", "mapping"):
+    CONSOLE_ROLE = "patrol"
+PID_FILE = DATA / f"{CONSOLE_ROLE}_console.pid"
 app = Flask(__name__)
 sync_lock = threading.Lock()
 sync_started = False
@@ -145,7 +151,15 @@ def _route_path(name: object) -> Path:
 
 @app.get("/")
 def index():
+    if CONSOLE_ROLE == "mapping":
+        return send_file(MAPPING_PAGE)
     return send_file(PAGE)
+
+
+@app.get("/mapping")
+def mapping_console():
+    """Slow-mapping UI. Prefer start_mapping_console.sh (role=mapping, port 7782)."""
+    return send_file(MAPPING_PAGE)
 
 
 def _http_up(url: str) -> bool:
@@ -164,21 +178,28 @@ def _http_up(url: str) -> bool:
 
 
 def _viz_unavailable(name: str, url: str):
+    starter = (
+        "./start_mapping_console.sh"
+        if CONSOLE_ROLE == "mapping"
+        else "./start_remote_console.sh"
+    )
+    action = "启动慢速建图" if CONSOLE_ROLE == "mapping" else "启动采图"
+    home = "慢速建图台" if CONSOLE_ROLE == "mapping" else "巡检调度台"
     body = (
         "<!doctype html><meta charset='utf-8'><title>"
         f"{name} 未启动</title>"
         "<body style='font:16px/1.45 system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem'>"
         f"<h1>{name} 现在打不开</h1>"
         "<p>Command Center / Rerun 必须经本机 SSH 隧道访问（127.0.0.1:7779 / 9878）。"
-        "请用 <code>./start_remote_console.sh</code> 启动调度台（脚本会自动建立隧道），"
-        "并先点「启动采图」等 DimOS 在 Orin 上监听后再打开。</p>"
+        f"请用 <code>{starter}</code> 启动（脚本会自动建立隧道），"
+        f"并先点「{action}」等 DimOS 在 Orin 上监听后再打开。</p>"
         "<p>不要直接打开 Orin 的 <code>192.168.123.18:7779/</code> 首页："
         "DimOS 页面里的 iframe 写死了 localhost，在上位机浏览器里会变成 "
         "「localhost refused to connect」。</p>"
-        "<p>请回到调度台点击<strong>启动采图</strong>。DimOS 连上 Go2 后会 StandUp；"
+        f"<p>请回到{home}点击<strong>{action}</strong>。DimOS 连上 Go2 后会 StandUp；"
         "周围空旷，急停握在手里。站立完成后刷新本页即可遥控。</p>"
         f"<p>当前目标地址：<code>{url or '未配置'}</code></p>"
-        "<p><a href='/'>返回调度台</a></p>"
+        f"<p><a href='/'>返回{home}</a></p>"
         "</body>"
     )
     return body, 503, {"Content-Type": "text/html; charset=utf-8"}
@@ -189,10 +210,16 @@ def command_center():
     if not ROBOT_COMMAND_CENTER_URL:
         return _viz_unavailable("Command Center", "")
     if not _http_up(ROBOT_COMMAND_CENTER_URL):
+        # The tab opens right after start; DimOS needs several seconds before it listens on 7779.
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline and not _http_up(ROBOT_COMMAND_CENTER_URL):
+            time.sleep(1)
+    if not _http_up(ROBOT_COMMAND_CENTER_URL):
         return _viz_unavailable("Command Center", ROBOT_COMMAND_CENTER_URL)
     from flask import redirect
 
-    return redirect(ROBOT_COMMAND_CENTER_URL)
+    # The Orin page has a 2022 Last-Modified, so browsers keep a stale copy for months; a new query forces a fetch.
+    return redirect(f"{ROBOT_COMMAND_CENTER_URL}?t={int(time.time())}")
 
 
 def _rerun_cacheable(path: str) -> bool:
@@ -414,7 +441,16 @@ def save_route():
 @app.post("/api/mapping/start")
 def start_mapping():
     body = request.get_json(silent=True) or {}
-    result, code = _agent("mapping/start", "POST", {"name": body.get("name", "go2-map")})
+    # Mapping console always uses quality (slow) profile unless explicitly overridden.
+    default_profile = "quality" if CONSOLE_ROLE == "mapping" else "standard"
+    payload = {
+        "name": body.get("name", "go2-map"),
+        "profile": body.get("profile", default_profile),
+    }
+    if body.get("walk_mps") is not None:
+        payload["walk_mps"] = body.get("walk_mps")
+    # Orphan cleanup + WebRTC standup can exceed the default 15s agent timeout.
+    result, code = _agent("mapping/start", "POST", payload, timeout=90.0)
     return jsonify(result), code
 
 
@@ -430,8 +466,10 @@ def export_map():
     body = request.get_json(silent=True) or {}
     raw = str(body.get("map") or body.get("name") or "")
     stem = Path(raw).name
-    if stem.endswith(".pc2.lcm"):
-        stem = stem[: -len(".pc2.lcm")]
+    for suffix in (".pc2.lcm", ".map.db", ".db", ".rrd"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
     if not re.fullmatch(r"[A-Za-z0-9_-]+", stem):
         return jsonify(error="Select a valid map recording name."), 400
     result, code = _agent(f"maps/{urllib.parse.quote(stem)}/export", "POST", {}, timeout=30.0)
@@ -461,6 +499,12 @@ def wifi_connect():
         timeout=60.0,
     )
     return jsonify(result), code
+
+
+@app.before_request
+def _block_patrol_on_mapping_console():
+    if CONSOLE_ROLE == "mapping" and request.path.startswith("/api/patrol/"):
+        return jsonify(error="慢速建图台不提供巡检控制；请用 ./start_remote_console.sh。"), 403
 
 
 @app.post("/api/patrol/start")
@@ -517,7 +561,12 @@ def resume_patrol():
 
 @app.post("/api/patrol/confirm-pose")
 def confirm_pose():
-    result, code = _agent("patrol/confirm-pose", "POST", {})
+    body = request.get_json(silent=True) or {}
+    payload = {
+        "speed_mode": body.get("speed_mode", "slow"),
+        "speed_mps": body.get("speed_mps", 0),
+    }
+    result, code = _agent("patrol/confirm-pose", "POST", payload)
     return jsonify(result), code
 
 
@@ -544,8 +593,18 @@ def _tail_local(path: Path, count: int = 100) -> list[str]:
         return []
 
 
+def _write_pid_file() -> None:
+    try:
+        PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 if __name__ == "__main__":
     host = os.environ.get("REMOTE_CONSOLE_HOST", "127.0.0.1")
-    port = int(os.environ.get("REMOTE_CONSOLE_PORT", "7781"))
+    default_port = "7782" if CONSOLE_ROLE == "mapping" else "7781"
+    port = int(os.environ.get("REMOTE_CONSOLE_PORT", default_port))
+    _write_pid_file()
     _start_sync_thread()
+    print(f"Console role={CONSOLE_ROLE} on http://{host}:{port}/", flush=True)
     app.run(host=host, port=port, debug=False, threaded=True)

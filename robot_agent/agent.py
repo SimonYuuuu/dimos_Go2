@@ -27,6 +27,11 @@ STATUS_FILE = DATA / "patrol-status.json"
 CONTROL_FILE = DATA / "patrol-control.json"
 NUDGE_FILE = DATA / "pose-nudge.json"
 DOG_POSE_FILE = DATA / "dog-pose.json"
+SPEED_FILE = DATA / "patrol-speed.json"
+KEEPOUT_FILE = DATA / "patrol-keepouts.json"
+SLOW_MPS = 0.35
+FAST_MPS = 0.70
+MAX_MPS = 1.0
 EVENTS_FILE = DATA / "fire-alarm-events.jsonl"
 MAPPING_LOG = DATA / "mapping.log"
 PATROL_LOG = DATA / "patrol.log"
@@ -46,7 +51,9 @@ app = Flask(__name__)
 lock = threading.RLock()
 mapping_proc: subprocess.Popen[bytes] | None = None
 mapping_name: str | None = None
+mapping_profile: str = "standard"
 patrol_proc: subprocess.Popen[bytes] | None = None
+MAP_QUALITY_MPS = 0.25
 _reachability: dict[str, Any] = {"checked_at": 0.0}
 _export_lock = threading.Lock()
 _export_status: dict[str, Any] = {
@@ -83,6 +90,45 @@ def _tail(path: Path, count: int = 100) -> list[str]:
         return []
 
 
+_LOG_NOISE_RE = re.compile(
+    r"aiortc|avcodec_send_packet|Invalid data found|Zenoh endpoints|^[=\s]*$|"
+    r"Rerun gRPC|Connect a viewer|dimos-viewer --connect|hostname:|Deployed module|Worker |"
+    r"load back with|from dimos\.msgs|pcd = PointCloud2",
+)
+_LOG_PROGRESS_RE = re.compile(r"\d+%")
+
+
+def _mapping_log_for_ui(count: int = 60) -> list[str]:
+    """Mapping/export log without video-decode spam; progress bars keep only their last update."""
+    try:
+        with MAPPING_LOG.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 200_000))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[str] = []
+    heartbeat = ""
+    progress_at: dict[str, int] = {}
+    for line in text.splitlines():
+        line = line.rstrip()
+        if _LOG_NOISE_RE.search(line):
+            continue
+        if "[heartbeat]" in line:
+            heartbeat = line
+            continue
+        if _LOG_PROGRESS_RE.search(line):
+            key = _LOG_PROGRESS_RE.split(line)[0]
+            if key in progress_at:
+                out[progress_at[key]] = line
+                continue
+            progress_at[key] = len(out)
+        out.append(line)
+    if heartbeat:
+        out.append(heartbeat)
+    return out[-count:]
+
+
 def _reloc_log_tail(count: int = 50) -> list[str]:
     """Key reloc lines from DimOS log (console only showed launcher patrol.log before)."""
     hits = [line for line in _tail(PATROL_DIMOS_LOG, 800) if _RELOC_LOG_RE.search(line)]
@@ -112,6 +158,133 @@ def _dimos_stop() -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         pass
+
+
+def _viz_ports_busy() -> bool:
+    return any(_tcp_open("127.0.0.1", port) for port in (7779, 9877, 9878, 3030))
+
+
+def _pkill_patterns(*patterns: str) -> None:
+    for pattern in patterns:
+        subprocess.run(
+            ["pkill", "-TERM", "-f", pattern],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _pgrep(pattern: str) -> bool:
+    result = subprocess.run(
+        ["pgrep", "-f", pattern],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _mapping_active_external() -> bool:
+    """True when a mapping shell/DimOS is up even if this agent lost the Popen handle."""
+    return _pgrep(r"start_mapping_quality\.sh|/start_mapping\.sh|unitree-go2-memory") and _viz_ports_busy()
+
+
+def _mapping_is_running() -> bool:
+    return _running(mapping_proc) or _mapping_active_external()
+
+
+def _mapping_cmdline_db() -> str | None:
+    """Best-effort db path from a live dimos/mapping process cmdline."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", r"go2memory.db-path|start_mapping"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    for line in (result.stdout or "").splitlines():
+        match = re.search(r"--go2memory\.db-path\s+(\S+)", line)
+        if match:
+            return match.group(1)
+        match = re.search(r"maps/([A-Za-z0-9_-]+)\.db", line)
+        if match:
+            return str(MAPS / f"{match.group(1)}.db")
+    return None
+
+
+def _mapping_live_info() -> dict[str, Any]:
+    """Extra fields so the console can show whether logs/session are actually alive."""
+    info: dict[str, Any] = {
+        "log_path": str(MAPPING_LOG),
+        "log_age_s": None,
+        "log_bytes": None,
+        "db_path": _mapping_cmdline_db(),
+        "heartbeat_ok": False,
+        "last_log_line": None,
+    }
+    try:
+        st = MAPPING_LOG.stat()
+        info["log_bytes"] = int(st.st_size)
+        info["log_age_s"] = round(max(0.0, time.time() - st.st_mtime), 1)
+    except OSError:
+        pass
+    lines = _tail(MAPPING_LOG, 40)
+    if lines:
+        info["last_log_line"] = lines[-1][:240]
+        recent = lines[-12:]
+        info["heartbeat_ok"] = any("[heartbeat]" in line for line in recent) and (
+            info["log_age_s"] is not None and info["log_age_s"] < 12
+        )
+    if info["db_path"]:
+        try:
+            info["db_name"] = Path(info["db_path"]).name
+            info["db_bytes"] = int(Path(info["db_path"]).stat().st_size)
+        except OSError:
+            info["db_name"] = Path(info["db_path"]).name
+    return info
+
+
+def _clear_orphan_mapping() -> bool:
+    """Stop leftover mapping DimOS only when it is not a healthy live session.
+
+    Live sessions (start_mapping* + viz ports) are left alone so agent restarts
+    do not kill an in-progress capture.
+    """
+    if _running(mapping_proc) or _running(patrol_proc):
+        return False
+    if _mapping_active_external():
+        return False
+    if not _viz_ports_busy() and not _pgrep("start_mapping"):
+        return False
+    _dimos_stop()
+    _pkill_patterns(
+        r"start_mapping_quality\.sh",
+        r"[/ ]start_mapping\.sh",
+        r"dimos --viewer rerun",
+        r"unitree-go2-memory",
+    )
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        if not _viz_ports_busy() and not _pgrep("start_mapping"):
+            break
+        time.sleep(0.4)
+    if _viz_ports_busy():
+        _pkill_patterns(
+            r"start_mapping_quality\.sh",
+            r"[/ ]start_mapping\.sh",
+            r"dimos --viewer rerun",
+            r"unitree-go2-memory",
+        )
+        subprocess.run(
+            ["pkill", "-KILL", "-f", r"dimos --viewer rerun"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.5)
+    return True
 
 
 def _map_stem(value: object) -> str:
@@ -208,8 +381,14 @@ def _export_map_async(
                 if gomp not in preload.split(":"):
                     env["LD_PRELOAD"] = f"{gomp}:{preload}" if preload else gomp
             # Localization-ready defaults (export_map.sh also has these fallbacks).
-            env.setdefault("DIMOS_MAP_VOXEL", "0.03")
-            env.setdefault("DIMOS_MAP_PGO_TOL", "0.08")
+            # Quality mapping uses a denser rebuild so walls stay sharp.
+            if env.get("DIMOS_MAP_QUALITY", "0") in ("1", "true", "TRUE", "yes", "YES"):
+                env.setdefault("DIMOS_MAP_VOXEL", "0.025")
+                env.setdefault("DIMOS_MAP_PGO_TOL", "0.06")
+                env.setdefault("DIMOS_MAP_FULL_PGO", "1")
+            else:
+                env.setdefault("DIMOS_MAP_VOXEL", "0.03")
+                env.setdefault("DIMOS_MAP_PGO_TOL", "0.08")
             env.setdefault("DIMOS_MAP_DENOISE", "1")
             with MAPPING_LOG.open("ab") as log:
                 log.write(
@@ -488,11 +667,16 @@ def status():
         clock=_clock_snapshot(),
         connectivity=connectivity,
         mapping={
-            "running": _running(mapping_proc),
-            "name": mapping_name,
+            "running": _mapping_is_running(),
+            "name": mapping_name or ("external" if _mapping_active_external() else None),
+            "profile": (
+                mapping_profile
+                if _running(mapping_proc)
+                else ("quality" if _mapping_active_external() else "idle")
+            ),
             "phase": (
                 "recording"
-                if _running(mapping_proc)
+                if _mapping_is_running()
                 else (
                     "exporting"
                     if _export_status.get("running")
@@ -504,7 +688,8 @@ def status():
                 )
             ),
             "export": dict(_export_status),
-            "log": _tail(MAPPING_LOG, 60),
+            "live": _mapping_live_info(),
+            "log": _mapping_log_for_ui(60),
         },
         patrol={
             **patrol,
@@ -512,6 +697,7 @@ def status():
             "log": _patrol_log_for_ui(),
             "reloc_log": _reloc_log_tail(50),
             "dog_pose": _dog_pose(),
+            "walk_speed": _read_json(SPEED_FILE, {}) if _running(patrol_proc) else {},
         },
         fire_alarm={
             "state": control.get("fire_state", "NaN"),
@@ -593,29 +779,97 @@ def map_artifact(name: str, kind: str):
 
 @app.post("/api/v1/mapping/start")
 def start_mapping():
-    global mapping_proc, mapping_name
+    global mapping_proc, mapping_name, mapping_profile
     body = request.get_json(silent=True) or {}
     try:
         name = _safe_name(body.get("name", "go2-map"))
     except ValueError as error:
         return jsonify(error=str(error)), 400
+    profile = str(body.get("profile", "standard")).strip().lower()
+    if profile not in ("standard", "quality"):
+        return jsonify(error="profile must be standard or quality."), 400
     if DIMOS_MODE != "real":
         return jsonify(error="Robot agent only accepts real-robot tasks; simulation stays in simulation_legacy."), 409
     if not ROBOT_IP:
         return jsonify(error="Configure ROBOT_IP on the robot agent host."), 503
     if not DIMOS_BIN.is_file():
         return jsonify(error="DimOS is not installed in simulation_legacy/.venv on the robot."), 503
+    # Quality mapping lives at repo root (same level as stop_dimos.sh).
+    script = (
+        PROJECT / "start_mapping_quality.sh"
+        if profile == "quality"
+        else SIM_ROOT / "start_mapping.sh"
+    )
+    if not script.is_file():
+        return jsonify(error=f"Missing mapping script {script.name} on the robot."), 503
     with lock:
-        if _running(mapping_proc) or _running(patrol_proc):
-            return jsonify(error="Another robot task is already active."), 409
+        if _running(mapping_proc) or _mapping_active_external():
+            return jsonify(
+                ok=True,
+                already_running=True,
+                pid=mapping_proc.pid if mapping_proc and _running(mapping_proc) else None,
+                name=mapping_name or name,
+                profile=mapping_profile if _running(mapping_proc) else profile,
+                message=(
+                    f"Mapping already running ({mapping_name or name}). "
+                    "Open Command Center to drive; do not start again."
+                ),
+            )
+        if _running(patrol_proc):
+            return jsonify(error="Patrol is active; stop it before mapping."), 409
         if _export_status.get("running"):
             return jsonify(error="Map export is still running; wait before starting a new capture."), 409
+
+    # Clear dead viz leftovers only (healthy live mapping is not killed).
+    if _viz_ports_busy() or _pgrep("start_mapping"):
+        _clear_orphan_mapping()
+        if _mapping_active_external():
+            return jsonify(
+                ok=True,
+                already_running=True,
+                name=name,
+                profile=profile,
+                message="Mapping already running. Open Command Center to drive.",
+            )
+        if _viz_ports_busy():
+            return jsonify(
+                error="Viz ports 7779/9877/9878 still busy. On Orin run: ./simulation_legacy/stop_mapping.sh"
+            ), 409
+
+    with lock:
+        if _running(mapping_proc) or _running(patrol_proc) or _mapping_active_external():
+            return jsonify(
+                ok=True,
+                already_running=True,
+                name=mapping_name or name,
+                profile=profile,
+                message="Mapping already running. Open Command Center to drive.",
+            )
         env = os.environ.copy()
         env.pop("ROBOT_AGENT_TOKEN", None)
         env.pop("UNITREE_AES_128_KEY", None)
         env.update(DIMOS_MODE="real", ROBOT_IP=ROBOT_IP)
         if AES_KEY:
             env["GO2CONNECTION__AES_128_KEY"] = AES_KEY
+        if profile == "quality":
+            mps = float(body.get("walk_mps", MAP_QUALITY_MPS))
+            if not math.isfinite(mps) or mps < 0.05 or mps > 0.40:
+                return jsonify(error="walk_mps for quality mapping must be from 0.05 to 0.40."), 400
+            # Quality = slow teleop + OA off. Export knobs match remote console
+            # so stop→export stays fast (override via env if denser PGO is needed).
+            env.update(
+                DIMOS_MAP_QUALITY=env.get("DIMOS_MAP_QUALITY", "0"),
+                DIMOS_MAP_WALK_MPS=str(mps),
+                DIMOS_MAP_VOXEL=env.get("DIMOS_MAP_VOXEL", "0.03"),
+                DIMOS_MAP_PGO_TOL=env.get("DIMOS_MAP_PGO_TOL", "0.08"),
+                DIMOS_MAP_DENOISE=env.get("DIMOS_MAP_DENOISE", "1"),
+                DIMOS_MAP_FULL_PGO=env.get("DIMOS_MAP_FULL_PGO", "0"),
+                PATROL_SPEED_FILE=str(SPEED_FILE),
+            )
+            _write_json(SPEED_FILE, {"mps": mps, "locked": True, "mode": "map_quality"})
+        # Script owns mapping.log (heartbeat + DimOS). Agent only seeds/truncates.
+        env["MAPPING_LOG_FILE"] = str(MAPPING_LOG)
+        env["MAPPING_LOG_ATTACHED"] = "1"
         gomp = "/lib/aarch64-linux-gnu/libgomp.so.1"
         if Path(gomp).is_file():
             preload = env.get("LD_PRELOAD", "")
@@ -634,59 +888,123 @@ def start_mapping():
                     env["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_path}" if ld_path else lib_dir
                 env.setdefault("TURBOJPEG", str(tj))
                 break
-        with MAPPING_LOG.open("wb") as log:
+        MAPPING_LOG.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate for a fresh session, keep fd open for the child (do not use `with`).
+        log_fh = MAPPING_LOG.open("wb")
+        try:
+            log_fh.write(f"==== agent mapping/start name={name} profile={profile} ====\n".encode())
+            log_fh.flush()
             mapping_proc = subprocess.Popen(
-                ["bash", str(SIM_ROOT / "start_mapping.sh"), name],
-                cwd=SIM_ROOT,
+                ["bash", str(script), name],
+                cwd=SIM_ROOT if profile != "quality" else PROJECT,
                 env=env,
-                stdout=log,
+                stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        finally:
+            # Child keeps a dup; parent copy can close.
+            try:
+                log_fh.close()
+            except OSError:
+                pass
         mapping_name = name
-    return jsonify(ok=True, pid=mapping_proc.pid, name=name)
+        mapping_profile = profile
+        proc = mapping_proc
+    # Detect immediate exit (port busy / preflight fail) so the UI gets a real error.
+    time.sleep(1.2)
+    if not _running(proc):
+        with lock:
+            if mapping_proc is proc:
+                mapping_proc = None
+                mapping_profile = "standard"
+        tail = "\n".join(_tail(MAPPING_LOG, 12))
+        return jsonify(
+            error="Mapping process exited immediately. " + (tail or "Check robot_data/mapping.log on Orin."),
+            log_tail=tail,
+        ), 500
+    return jsonify(ok=True, pid=proc.pid, name=name, profile=profile)
 
 
 @app.post("/api/v1/mapping/stop")
 def stop_mapping():
-    global mapping_proc, mapping_name
+    global mapping_proc, mapping_name, mapping_profile
     with lock:
         proc = mapping_proc
         name = mapping_name
-        if not _running(proc):
+        profile = mapping_profile
+        owned = _running(proc)
+        external = (not owned) and _mapping_active_external()
+        if not owned and not external:
             return jsonify(error="No mapping session is running."), 409
-        try:
-            os.killpg(proc.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
+        if owned:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
 
     stopped = False
-    try:
-        if proc.wait(timeout=25) is not None:
-            stopped = True
-    except subprocess.TimeoutExpired:
-        _dimos_stop()
+    if owned and proc is not None:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=20)
-            stopped = True
+            if proc.wait(timeout=25) is not None:
+                stopped = True
         except subprocess.TimeoutExpired:
+            _dimos_stop()
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=20)
+                stopped = True
             except subprocess.TimeoutExpired:
-                pass
-            stopped = proc.poll() is not None
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                stopped = proc.poll() is not None
+    else:
+        # Agent restarted and lost Popen; stop the external mapping shell/DimOS.
+        _dimos_stop()
+        _pkill_patterns(
+            r"start_mapping_quality\.sh",
+            r"[/ ]start_mapping\.sh",
+            r"dimos --viewer rerun",
+            r"unitree-go2-memory",
+        )
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            if not _mapping_active_external() and not _viz_ports_busy():
+                stopped = True
+                break
+            time.sleep(0.5)
+        if not stopped:
+            subprocess.run(
+                ["pkill", "-KILL", "-f", r"dimos --viewer rerun"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.5)
+            stopped = not _mapping_active_external()
 
     with lock:
         if mapping_proc is proc and not _running(proc):
             mapping_proc = None
+            mapping_profile = "standard"
+        if not _mapping_is_running():
+            mapping_proc = None
+            mapping_profile = "standard"
+
+    # Export uses console-standard PGO (same as remote console「结束采集并导出」).
+    os.environ.setdefault("DIMOS_MAP_VOXEL", "0.03")
+    os.environ.setdefault("DIMOS_MAP_PGO_TOL", "0.08")
+    os.environ.setdefault("DIMOS_MAP_FULL_PGO", "0")
+    os.environ.setdefault("DIMOS_MAP_DENOISE", "1")
 
     export_started = False
     export_name = None
@@ -697,10 +1015,11 @@ def stop_mapping():
         ok=True,
         stopped=stopped,
         name=name,
+        profile=profile,
         export_started=export_started,
         export_name=export_name,
         message=(
-            f"Mapping stopped; optimized PGO export writing {export_name}.pc2.lcm on the robot."
+            f"Mapping stopped; optimized PGO export writing {export_name}.pc2.lcm and {export_name}.map.db."
             if export_name
             else "Mapping stopped; no recording found to export."
         ),
@@ -826,6 +1145,12 @@ def start_patrol():
             env["DIMOS_INITIAL_POSE"] = "0,0,0"
         current_control = _read_json(CONTROL_FILE, {})
         current_fire = current_control.get("fire_state", "NaN") if isinstance(current_control, dict) else "NaN"
+        try:
+            keepouts = _keepouts_from_route(route)
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        _write_json(SPEED_FILE, {"mps": SLOW_MPS, "locked": False})
+        _write_json(KEEPOUT_FILE, keepouts)
         _control(stop_requested=False, halt=False, paused=current_fire == "Fire_alarm")
         with PATROL_LOG.open("wb") as log:
             patrol_proc = subprocess.Popen(
@@ -955,13 +1280,56 @@ def resume_patrol():
     return jsonify(ok=True, state="Safe")
 
 
+def _keepouts_from_route(route: dict) -> list:
+    zones = route.get("keepouts") or []
+    if not isinstance(zones, list) or len(zones) > 20:
+        raise ValueError("A route may contain at most 20 keepout zones.")
+    cleaned = []
+    for zone in zones:
+        points = zone.get("points") if isinstance(zone, dict) else zone
+        if not isinstance(points, list) or len(points) != 4:
+            raise ValueError("Each keepout zone needs four corners.")
+        quad = []
+        for point in points:
+            x = float(point["x"])
+            y = float(point["y"])
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError("Keepout corners must be finite.")
+            quad.append({"x": x, "y": y})
+        cleaned.append({"points": quad})
+    return cleaned
+
+
+def _walk_speed(body: dict) -> float:
+    mode = str(body.get("speed_mode", "slow"))
+    if mode == "slow":
+        return SLOW_MPS
+    if mode == "fast":
+        return FAST_MPS
+    if mode == "custom":
+        value = float(body.get("speed_mps"))
+        if not math.isfinite(value) or value < 0.05 or value > MAX_MPS:
+            raise ValueError("Custom speed must be from 0.05 to 1 m/s.")
+        return value
+    raise ValueError("speed_mode must be slow, fast, or custom.")
+
+
 @app.post("/api/v1/patrol/confirm-pose")
 def confirm_pose():
-    """Operator verified Rerun overlap; allow start_patrol to dispatch waypoints."""
+    """Operator verified Rerun overlap; lock the walk speed and allow waypoints."""
     if not _running(patrol_proc):
         return jsonify(error="No patrol task is running."), 409
+    current = _read_json(SPEED_FILE, {})
+    if isinstance(current, dict) and current.get("locked"):
+        return jsonify(error="Walk speed is already locked for this patrol."), 409
+    body = request.get_json(silent=True) or {}
+    try:
+        mps = _walk_speed(body)
+    except (TypeError, ValueError) as error:
+        return jsonify(error=str(error)), 400
+    _write_json(SPEED_FILE, {"mps": mps, "locked": True, "mode": body.get("speed_mode", "slow")})
     _control(pose_confirmed=True)
-    return jsonify(ok=True, message="Pose confirmed; navigation may start.")
+    return jsonify(ok=True, message="Pose confirmed; navigation may start.", mps=mps)
 
 
 @app.post("/api/v1/patrol/nudge-pose")

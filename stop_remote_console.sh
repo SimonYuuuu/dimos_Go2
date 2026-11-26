@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Stop the remote console and local SSH tunnels started by start_remote_console.sh
-# (including ones launched in the background by an agent).
+# Stop the patrol remote console and (by default) local SSH tunnels from start_remote_console.sh.
+# Does not stop the mapping console on 7782 — use ./stop_mapping_console.sh for that.
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA="$ROOT/remote_client/data"
+PID_FILE="$DATA/patrol_console.pid"
+LAUNCHER_PID_FILE="$DATA/patrol_console_launcher.pid"
+MAPPING_PID_FILE="$DATA/mapping_console.pid"
+PORT="${REMOTE_CONSOLE_PORT:-7781}"
 
 kill_port() {
   local port="$1"
@@ -17,27 +23,67 @@ kill_port() {
   fi
 }
 
-echo "Stopping remote console + viz tunnels..."
-pkill -f '/remote_client/console.py' 2>/dev/null || true
-pkill -f 'start_remote_console.sh' 2>/dev/null || true
+kill_pidfile() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    local pid
+    pid="$(tr -d '[:space:]' <"$file" || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.3
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$file"
+  fi
+}
 
-# Local forwards used by start_remote_console.sh
-for port in 7781 7779 9878 9877 3030 17779 19878 19877 13030 27779 29878 29877 23030; do
-  kill_port "$port"
-done
+echo "Stopping patrol console + viz tunnels..."
+kill_pidfile "$PID_FILE"
+kill_pidfile "$LAUNCHER_PID_FILE"
+pkill -f 'start_remote_console\.sh' 2>/dev/null || true
+if command -v pgrep >/dev/null 2>&1; then
+  while read -r pid; do
+    [[ -z "$pid" ]] && continue
+    envf="/proc/$pid/environ"
+    if [[ -r "$envf" ]] && tr '\0' '\n' <"$envf" 2>/dev/null | grep -qx 'DIMOS_CONSOLE_ROLE=mapping'; then
+      continue
+    fi
+    # Default / missing role = patrol console.
+    kill "$pid" 2>/dev/null || true
+  done < <(pgrep -f '/remote_client/console\.py' || true)
+fi
+kill_port "$PORT"
 
-# Detached ssh -fNT tunnels to Orin (wire / iphone / guest / ap aliases)
-pkill -f 'ssh -fNT .*go2-orin' 2>/dev/null || true
+mapping_up=0
+if [[ -f "$MAPPING_PID_FILE" ]]; then
+  mpid="$(tr -d '[:space:]' <"$MAPPING_PID_FILE" || true)"
+  if [[ "$mpid" =~ ^[0-9]+$ ]] && kill -0 "$mpid" 2>/dev/null; then
+    mapping_up=1
+  fi
+fi
+if [[ "$mapping_up" -eq 0 ]] && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq ':7782$'; then
+  mapping_up=1
+fi
+
+if [[ "$mapping_up" -eq 0 ]]; then
+  for port in 7779 9878 9877 3030 17779 19878 19877 13030 27779 29878 29877 23030; do
+    kill_port "$port"
+  done
+  pkill -f 'ssh -fNT .*go2-orin' 2>/dev/null || true
+else
+  echo "Mapping console still up on 7782 — leaving shared SSH tunnels alone."
+fi
 
 sleep 0.5
-left="$(ss -ltnH 2>/dev/null | awk '$4 ~ /:(7781|7779|9878|9877|3030)$/' || true)"
+left="$(ss -ltnH 2>/dev/null | awk '$4 ~ /:(7781)$/' || true)"
 if [[ -n "$left" ]]; then
-  echo "WARN: some ports still listening:"
+  echo "WARN: port 7781 still listening:"
   echo "$left"
-  echo "Try: fuser -k 7781/tcp 7779/tcp 9878/tcp 9877/tcp 3030/tcp"
+  echo "Try: fuser -k 7781/tcp"
   exit 1
 fi
 
-echo "Stopped. Ports 7781/7779/9878/9877/3030 are free."
-echo "Start again in the foreground with:"
+echo "Patrol console stopped. Ports 7781 free (tunnels kept if mapping console live)."
+echo "Start again:"
 echo "  ./start_remote_console.sh --link iphone   # or --link wire"
+echo "Mapping console: ./start_mapping_console.sh --link iphone"

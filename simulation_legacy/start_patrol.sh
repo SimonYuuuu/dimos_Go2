@@ -26,6 +26,9 @@ export DIMOS_RELOC_SETTLE_N=3
 # 1: first lock is the typed initial pose (operator places the dog, then nudges
 # in the console). 0: lidar match against the loaded map.
 export DIMOS_RELOC_TRUST_HINT="${DIMOS_RELOC_TRUST_HINT:-1}"
+# Raw lidar + odometry for offline matcher tests; only the latest patrol is kept.
+export DIMOS_RELOC_RECORD_DIR="${DIMOS_RELOC_RECORD_DIR:-$ROOT/../robot_data/reloc-rec}"
+rm -rf "$DIMOS_RELOC_RECORD_DIR"
 # Loaded map stays off the Rerun view. The live cloud is matched against it
 # in the background; global map and costmap remain.
 export DIMOS_SHOW_LOADED_MAP=0
@@ -294,6 +297,10 @@ if [[ -f "$ROOT/../scripts/apply_odom_stamp_patch.py" ]]; then
     >/dev/null 2>&1 || true
 fi
 # Sport Move never enters the avoidance service. Route velocity through it.
+if [[ -f "$ROOT/../scripts/apply_lidar_watch_patch.py" ]]; then
+  "$ROOT/.venv/bin/python" "$ROOT/../scripts/apply_lidar_watch_patch.py" \
+    >/dev/null 2>&1 || true
+fi
 if [[ -f "$ROOT/../scripts/apply_avoid_move_patch.py" ]]; then
   "$ROOT/.venv/bin/python" "$ROOT/../scripts/apply_avoid_move_patch.py" \
     "$ROOT/.venv/lib/python3.12/site-packages/dimos/robot/unitree/connection.py" \
@@ -320,21 +327,35 @@ for _nav_patch in \
   apply_nav_slow_turn_patch.py \
   apply_nav_yaw_fallback_patch.py \
   apply_nav_speed_cap_patch.py \
+  apply_walk_speed_keepout_patch.py \
   apply_nav_obstacle_hold_patch.py \
   apply_path_mask_tolerance_patch.py \
   apply_nav_hold_guard_patch.py \
   apply_nav_live_cloud_patch.py \
   apply_live_costmap_fuse_patch.py \
+  apply_costmap_follow_patch.py \
   apply_track_fitness_height_patch.py \
   apply_nav_planner_survive_patch.py \
   apply_reloc_recover_patch.py \
   apply_nav_smooth_patch.py \
-  apply_reloc_track_dog_bound_patch.py
+  apply_reloc_track_dog_bound_patch.py \
+  apply_reloc_yaw_budget_patch.py \
+  apply_reloc_slow_correct_patch.py \
+  apply_reloc_record_patch.py \
+  apply_reloc_track_scan_patch.py \
+  apply_rerun_latest_only_patch.py
 do
   if [[ -f "$ROOT/../scripts/$_nav_patch" ]]; then
     "$ROOT/.venv/bin/python" "$ROOT/../scripts/$_nav_patch" >/dev/null 2>&1 || true
   fi
 done
+
+# A broken relocalize.py only logs errors while the patrol walks on odometry alone.
+if ! "$ROOT/.venv/bin/python" "$ROOT/../scripts/check_reloc_patch.py"; then
+  echo "relocalize.py failed its self-check; not starting the patrol." >&2
+  printf '{"phase":"error","message":"relocalize.py 补丁自检失败，定位会失效，见 patrol.log"}\n' > "$STATUS_FILE"
+  exit 1
+fi
 
 echo "Starting $MODE localization for map $MAP (blueprint=$PATROL_BLUEPRINT + $RELOC_MODULE)"
 if [[ -n "${DIMOS_INITIAL_POSE:-}" ]]; then

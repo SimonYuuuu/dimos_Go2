@@ -27,6 +27,7 @@ LOCAL_RERUN_WEB_PORT="${LOCAL_RERUN_WEB_PORT:-9878}"
 LOCAL_RERUN_GRPC_PORT="${LOCAL_RERUN_GRPC_PORT:-9877}"
 LOCAL_RERUN_WS_PORT="${LOCAL_RERUN_WS_PORT:-3030}"
 
+export DIMOS_CONSOLE_ROLE="${DIMOS_CONSOLE_ROLE:-patrol}"
 export REMOTE_CONSOLE_HOST="${REMOTE_CONSOLE_HOST:-127.0.0.1}"
 export REMOTE_CONSOLE_PORT="${REMOTE_CONSOLE_PORT:-7781}"
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,${ORIN_AGENT_HOST}}"
@@ -134,7 +135,11 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 2
 fi
 
-echo "Remote console on http://${REMOTE_CONSOLE_HOST}:${REMOTE_CONSOLE_PORT}/"
+mkdir -p "$ROOT/remote_client/data"
+printf '%s\n' "$$" >"$ROOT/remote_client/data/patrol_console_launcher.pid"
+
+echo "Patrol console on http://${REMOTE_CONSOLE_HOST}:${REMOTE_CONSOLE_PORT}/"
+echo "Slow mapping:   ./start_mapping_console.sh  → http://127.0.0.1:7782/"
 echo "Command Center: ${ROBOT_COMMAND_CENTER_URL}"
 echo "Rerun:          ${ROBOT_RERUN_URL}"
 
