@@ -5,36 +5,67 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DimOS · 仓库巡检调度台</title>
   <style>
-    :root { color-scheme: light; --ink:#172923; --muted:#62736a; --line:#d9e2db; --paper:#f1f5f1; --card:#fff; --green:#176447; --amber:#a76113; --red:#a63b32; }
+    :root { color-scheme: light; --ink:#172923; --muted:#62736a; --line:#d9e2db; --paper:#eef3ef; --card:#fff; --green:#176447; --amber:#a76113; --red:#b3261e; }
     * { box-sizing:border-box }
-    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.45 Inter,system-ui,sans-serif }
-    header { display:flex; align-items:center; justify-content:space-between; padding:20px max(24px,calc((100vw - 1440px)/2)); background:#173d2e; color:#fff }
-    header h1 { margin:0; font-size:22px; letter-spacing:.02em }
+    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.45 Inter,system-ui,"PingFang SC","Microsoft YaHei",sans-serif }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:14px max(24px,calc((100vw - 1480px)/2)); background:#173d2e; color:#fff }
+    header h1 { margin:0; font-size:21px; letter-spacing:.02em }
     header span { color:#bfd5c7; font-size:13px }
-    main { max-width:1440px; padding:22px 24px 48px; margin:auto }
-    .toolbar,.columns { display:grid; grid-template-columns: minmax(310px,.78fr) minmax(520px,1.5fr); gap:18px; align-items:start }
-    .stack { display:grid; gap:18px }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; box-shadow:0 3px 14px #183b2910 }
+    .head-links { display:flex; gap:8px }
+    .head-links a { color:#fff; font-size:13px; text-decoration:none; border:1px solid #ffffff55; border-radius:7px; padding:6px 11px }
+    .head-links a:hover { background:#ffffff1c }
+    main { max-width:1480px; padding:18px 24px 56px; margin:auto }
+    .zone { display:flex; align-items:baseline; gap:10px; margin:26px 2px 12px; font-size:13px; font-weight:700; letter-spacing:.08em; color:var(--muted); border-bottom:1px solid var(--line); padding-bottom:7px }
+    .zone:first-child { margin-top:0 }
+    .zone small { font-weight:500; letter-spacing:0 }
+    .top { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(0,1fr); gap:18px; align-items:start }
+    .two { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:18px; align-items:start }
+    .card { min-width:0; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; box-shadow:0 3px 14px #183b2910 }
     h2 { margin:0 0 14px; font-size:17px }
-    h3 { margin:17px 0 8px; font-size:14px }
-    .sub { margin:-6px 0 12px; color:var(--muted); font-size:13px }
-    label { display:block; margin:11px 0 5px; font-size:13px; font-weight:650 }
+    h3 { display:flex; align-items:center; gap:8px; margin:20px 0 6px; font-size:14px }
+    h3:first-of-type { margin-top:4px }
+    h3 b { display:inline-grid; place-items:center; width:22px; height:22px; border-radius:50%; background:var(--green); color:#fff; font-size:12px }
+    .sub { margin:6px 0 10px; color:var(--muted); font-size:13px }
+    label { display:block; margin:10px 0 5px; font-size:13px; font-weight:650 }
     input,select,button { min-height:38px; border:1px solid #bac9bf; border-radius:7px; padding:8px 10px; font:inherit; background:#fff; color:var(--ink) }
     input,select { width:100% }
-    button { cursor:pointer; font-weight:650; transition:.15s ease }
+    button { cursor:pointer; font-weight:650; white-space:nowrap; transition:.15s ease }
     button:hover { filter:brightness(.96); transform:translateY(-1px) }
     button.primary { border-color:var(--green); background:var(--green); color:white }
     button.stop { background:var(--red); color:white; border-color:var(--red) }
+    button.warn { background:#fff3dc; border-color:#d9a548; color:#6b4508 }
     button.secondary { background:#edf4ef }
+    button.big { min-height:46px; padding:10px 18px; font-size:15px }
     button:disabled { opacity:.5; cursor:not-allowed; transform:none }
-    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px }
-    .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px }
-    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px }
+    .row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px }
+    .row3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px }
+    .pick { display:flex; gap:6px }
+    .pick select { min-width:0 }
+    .pick button { flex:none }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px }
     .notice { border-left:4px solid #d39a35; background:#fff7e8; padding:10px 12px; border-radius:4px; color:#684719; font-size:13px; margin:12px 0 }
     .status { display:flex; align-items:center; gap:8px; padding:9px 11px; border-radius:7px; background:#edf4ef; margin:8px 0; font-size:13px }
     .dot { width:9px; height:9px; border-radius:50%; background:#89978d; flex:none }
     .dot.running { background:#18a566; box-shadow:0 0 0 4px #18a56620 }
     .dot.error { background:#c34439 }
+    /* Live state: one large line the operator can read from across the room. */
+    .phase { border-radius:10px; padding:14px 16px; background:#eef1ef; border-left:8px solid #89978d }
+    .phase #phaseBig { font-size:26px; font-weight:750; line-height:1.2 }
+    .phase #phaseDetail { margin-top:4px; color:var(--muted); font-size:13px; min-height:19px }
+    .phase.run { background:#e4f5ec; border-color:#18a566 }
+    .phase.wait { background:#fff5e0; border-color:#d39a35 }
+    .phase.done { background:#e7f0fb; border-color:#3f7fc4 }
+    .phase.alarm { background:#fde5e2; border-color:var(--red) }
+    .phase.alarm #phaseBig { color:var(--red) }
+    .tiles { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:12px 0 }
+    .tile { border:1px solid var(--line); border-radius:9px; padding:10px 12px; background:#fbfcfb; min-width:0 }
+    .tile small { display:block; color:var(--muted); font-size:12px }
+    .tile strong { display:block; font-size:20px; line-height:1.3; overflow-wrap:anywhere }
+    .tile em { display:block; font-style:normal; color:var(--muted); font-size:12px; min-height:17px; overflow-wrap:anywhere }
+    .tile.bad { background:#fde5e2; border-color:#e9a59f }
+    .tile.bad strong { color:var(--red) }
+    .bar { height:6px; border-radius:3px; background:#dfe7e1; margin-top:6px; overflow:hidden }
+    .bar i { display:block; height:100%; width:0; background:#18a566; transition:width .4s }
     .map-wrap { position:relative }
     #mapCanvas { display:block; width:100%; height:min(59vh,590px); min-height:390px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; cursor:crosshair }
     .legend { display:flex; gap:15px; flex-wrap:wrap; color:var(--muted); font-size:12px; padding:9px 2px 0 }
@@ -44,98 +75,135 @@
     th,td { padding:7px; text-align:left; border-bottom:1px solid #e7ece8 }
     td input { min-width:70px; min-height:32px; padding:5px }
     .remove { min-height:29px; padding:4px 7px; color:var(--red); background:#fff4f2; border-color:#ebc7c2 }
-    pre { white-space:pre-wrap; overflow:auto; max-height:150px; background:#14221c; color:#d8e8dd; border-radius:7px; padding:10px; font:11px/1.4 ui-monospace,monospace }
-    pre#log { max-height:300px }
-    #message { min-height:22px; color:var(--green); font-size:13px; margin-top:9px }
+    pre { white-space:pre-wrap; overflow:auto; height:230px; margin:0; background:#14221c; color:#d8e8dd; border-radius:7px; padding:10px; font:11px/1.45 ui-monospace,monospace }
+    details.help { margin:6px 0; font-size:13px; color:var(--muted) }
+    details.help summary { cursor:pointer; color:var(--green); font-weight:650 }
+    #message { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:40; max-width:min(880px,92vw); margin:0; padding:10px 16px; border-radius:9px; background:#fff; border:1px solid var(--line); box-shadow:0 6px 24px #0003; font-size:14px; color:var(--green) }
+    #message:empty { display:none }
+    /* Fire alarm: banner and page edge flash until the operator confirms the scene is safe. */
+    #alarmBanner { display:none; position:sticky; top:0; z-index:30; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:14px max(24px,calc((100vw - 1480px)/2)); color:#fff; animation:alarmFlash 1s steps(1,end) infinite }
+    #alarmBanner strong { font-size:22px; margin-right:12px }
+    #alarmBanner button { min-height:46px; padding:10px 18px; font-size:15px; background:#fff; color:var(--red); border-color:#fff }
+    body.alarm #alarmBanner { display:flex }
+    body.alarm::after { content:""; position:fixed; inset:0; z-index:29; pointer-events:none; border:8px solid var(--red); animation:edgeFlash 1s steps(1,end) infinite }
+    @keyframes alarmFlash { 0% { background:#b3261e } 50% { background:#ff4a3d } }
+    @keyframes edgeFlash { 0% { opacity:1 } 50% { opacity:.15 } }
     .hidden { display:none!important }
-    @media(max-width:900px) { .toolbar,.columns { grid-template-columns:1fr } header { padding:16px 20px } main { padding:14px } #mapCanvas { height:55vh } }
+    @media(max-width:1100px) { .top,.two { grid-template-columns:minmax(0,1fr) } main { padding:14px } #mapCanvas { height:55vh } .tiles { grid-template-columns:1fr 1fr } }
   </style>
 </head>
 <body>
-<header><h1>DimOS · 仓库巡检调度台</h1><span>巡检任务 · 慢速建图请另开 <code style="color:#bfd5c7">./start_mapping_console.sh</code>（端口 7782）</span></header>
+<header>
+  <div><h1>DimOS · 仓库巡检调度台</h1><span>上方：任务下发与运行监控 · 中间：巡检路线编辑 · 下方：建图与调试</span></div>
+  <div class="head-links"><a href="/rerun" target="_blank" rel="noreferrer">Rerun 实时点云</a><a href="/command-center" target="_blank" rel="noreferrer">Command Center</a></div>
+</header>
+<div id="alarmBanner" role="alert">
+  <div><strong>火情警报</strong><span id="alarmText">机器狗已原地停下，任务保留。</span></div>
+  <button id="alarmResume" type="button">已排除火情，确认安全并继续巡检</button>
+</div>
 <main>
-  <section class="toolbar">
+  <div class="zone">任务运行 <small>后台值守时主要看这一块</small></div>
+  <section class="top">
     <div class="card">
-      <h2>连接与运行模式</h2>
+      <h2>当前作业状态</h2>
+      <div id="phaseBox" class="phase"><div id="phaseBig">正在连接…</div><div id="phaseDetail"></div></div>
+      <div class="tiles">
+        <div class="tile"><small>巡检轮次</small><strong id="tCycle">—</strong><em id="tCycleSub"></em></div>
+        <div class="tile"><small>本轮巡检点</small><strong id="tPoint">—</strong><div class="bar"><i id="pointBar"></i></div></div>
+        <div class="tile" id="batteryTile"><small>电量</small><strong id="tBattery">未知</strong><em id="tBatterySub">低于 5% 自动回出发点</em></div>
+        <div class="tile" id="fireTile"><small>火情信号</small><strong id="tFire">未接入</strong><em id="tFireSub"></em></div>
+        <div class="tile"><small>行走速度</small><strong id="tSpeed">—</strong><em id="tUpdated"></em></div>
+        <div class="tile"><small>狗在地图上的位置</small><strong id="tPose" style="font-size:16px">尚未锁定</strong><em id="tPoseSub"></em></div>
+      </div>
+      <div class="actions">
+        <button id="pausePatrol" class="warn big">火情 / 异常：原地暂停</button>
+        <button id="resumePatrol" class="primary big">确认现场安全并继续</button>
+        <button id="stopPatrol" class="secondary big">结束巡检并返航</button>
+        <button id="haltPatrol" class="stop big">立刻停下</button>
+      </div>
+      <p class="sub">暂停：原地站住，任务保留，点「确认现场安全并继续」后接着走原来的巡检点。结束并返航：先走回出发点再关闭任务，最多等三分钟。立刻停下：不返航，断开控制，狗会趴下，带线测试时用。</p>
+      <div id="linkStatus" class="status"><i class="dot"></i><span>正在连接 Orin robot agent…</span></div>
+      <div class="row" style="margin-top:10px">
+        <div><label>本趟巡检记录</label><pre id="progress">暂无活动任务</pre></div>
+        <div><label>运行日志</label><pre id="log">等待任务启动…</pre></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>巡检任务下发</h2>
+      <h3><b>1</b>选择地图和路线</h3>
+      <div class="row">
+        <div><label for="mapSelect">地图（默认最新）</label><div class="pick"><select id="mapSelect"></select><button id="refreshMaps" class="secondary">刷新</button></div></div>
+        <div><label for="routeSelect">巡检路线（默认最新）</label><div class="pick"><select id="routeSelect"></select><button id="loadRoute" class="secondary">加载</button></div></div>
+      </div>
+      <div class="status"><i class="dot"></i><span id="selectedMapSummary">巡检将使用上面选中的地图和路线</span></div>
+      <h3><b>2</b>任务参数</h3>
+      <div class="row3">
+        <div><label for="executionMode">启动方式</label><select id="executionMode"><option value="immediate">立即开始</option><option value="daily">预约一次（下次到该时刻）</option></select></div>
+        <div><label for="duration">任务时长 (min)</label><input id="duration" type="number" min="1" value="30"></div>
+        <div><label for="cycleMode">运行轮次</label><select id="cycleMode"><option value="repeat" selected>循环至任务时长</option><option value="single">只运行一轮</option></select></div>
+      </div>
+      <div id="dailyTimeWrap" class="hidden"><label for="startAt">本次预约时刻</label><input id="startAt" type="time"></div>
+      <div class="row">
+        <div><label for="speedMode">巡检速度</label><select id="speedMode"><option value="slow" selected>慢速（0.35 m/s）</option><option value="fast">快速（0.70 m/s）</option><option value="custom">自定义</option></select></div>
+        <div id="customSpeedWrap" class="hidden"><label for="speedMps">自定义速度 (m/s，最大 1)</label><input id="speedMps" type="number" min="0.05" max="1" step="0.05" value="0.5"></div>
+        <div id="repeatIntervalWrap"><label for="repeat">循环间隔 (min，0 为不间断)</label><input id="repeat" type="number" min="0" value="0"></div>
+      </div>
+      <p class="sub" id="speedHint">时长到了会先走完当前这一圈再回出发点。速度在点「确认位姿并开始行走」时锁定，任务结束后才能重选。</p>
+      <h3><b>3</b>填初始位姿，启动定位</h3>
+      <label for="mapPose">真机初始位姿 x,y,yaw（地图坐标系，米、弧度）</label>
+      <input id="mapPose" value="-0.345,-0.058,-2.2332" placeholder="例 1.2,-1.2,-1.57">
+      <details class="help"><summary>怎么填</summary>x、y 是米，和巡检点同一套地图坐标。yaw 是弧度，范围约 -3.14 到 3.14（0 朝地图 +X，1.57 左转 90°，-1.57 右转 90°，±3.14 掉头）。狗放在建图起点、朝向与建图开始时一致时填 0,0,0。每次点「确认位姿并开始行走」后，当时锁定的位姿会写回这里，下次默认用它。</details>
+      <div class="actions"><button id="startPatrol" class="primary big">启动巡检（狗站起并定位）</button></div>
+      <h3><b>4</b>核对定位，开始行走</h3>
+      <p class="sub">在 Rerun 里看点云和代价地图是否重合。站着时定位会自己往墙上贴；还差一点就用下面的微调。</p>
+      <div class="actions" style="margin-top:0"><select id="nudgeStep" style="width:auto"><option value="0.05,1">每次 5 cm / 1°</option><option value="0.2,5">每次 20 cm / 5°</option></select><button class="secondary" data-nudge="1,0,0">x +</button><button class="secondary" data-nudge="-1,0,0">x −</button><button class="secondary" data-nudge="0,1,0">y +</button><button class="secondary" data-nudge="0,-1,0">y −</button><button class="secondary" data-nudge="0,0,1">逆时针</button><button class="secondary" data-nudge="0,0,-1">顺时针</button></div>
+      <div class="actions"><button id="confirmPose" class="primary big">确认位姿并开始行走</button></div>
+    </div>
+  </section>
+
+  <div class="zone">巡检路线编辑 <small>在地图上摆巡检点、出发返回点和禁区</small></div>
+  <section class="card">
+    <div class="row" style="align-items:end">
+      <div class="status" style="margin:0"><i class="dot"></i><span id="mapStats">选择地图后显示点云信息</span></div>
+      <div class="row">
+        <div><label for="routeName" style="margin-top:0">保存路线名称</label><input id="routeName" value="warehouse-patrol"></div>
+        <div><label for="defaultDwell" style="margin-top:0">新增巡检点停留 (s)</label><input id="defaultDwell" type="number" min="0" value="10"></div>
+      </div>
+    </div>
+    <div class="actions"><button id="setStart" class="secondary">设置唯一出发 / 返回点</button><button id="addKeepout" class="secondary">添加禁区（四边形）</button><button id="clearKeepout" class="secondary">清除禁区</button><button id="optimizeRoute" class="secondary">优化巡检顺序</button><button id="saveRoute" class="primary">保存路线</button></div>
+    <p class="sub">左键添加巡检点；先点「设置唯一出发 / 返回点」再左键设置起点；右键撤销最近一个。点「添加禁区」后依次点四个角，框内视为障碍。清除禁区后要再点「保存路线」才生效。</p>
+    <div class="map-wrap"><canvas id="mapCanvas" width="1000" height="650"></canvas></div>
+    <div class="legend"><span><b style="background:#187a52"></b>唯一出发 / 返回点</span><span><b style="background:#e25832"></b>巡检点及顺序</span><span><b style="background:#6b4c9a"></b>禁区</span><span><b style="background:#9aa7a0"></b>地面(~低)</span><span><b style="background:#c45c26"></b>障碍/墙(~高)</span></div>
+    <div class="table-wrap"><table><thead><tr><th>#</th><th>X (m)</th><th>Y (m)</th><th>停留 (s)</th><th></th></tr></thead><tbody id="waypointRows"></tbody></table></div>
+  </section>
+
+  <div class="zone">建图与调试 <small>调试阶段使用，日常巡检不用动</small></div>
+  <section class="two">
+    <div class="card">
+      <h2>远程采图建图</h2>
+      <p class="sub">日常快采可用这里。定位级重采请用独立建图台：上位机 <code>./start_mapping_console.sh</code> → <code>http://127.0.0.1:7782/</code>（限速约 0.25 m/s，导出 .pc2.lcm + .map.db）。</p>
+      <div id="mappingStatus" class="status"><i class="dot"></i><span>采图：空闲</span></div>
+      <label for="mapName">新地图名称</label><input id="mapName" value="warehouse">
+      <div class="actions"><button id="startMapping" class="primary">启动采图</button><button id="stopMapping" class="stop">结束采集并导出地图</button><button id="exportMap" class="secondary">优化并导出当前选中地图</button><button type="button" id="openViz" class="secondary">打开 Command Center 和 Rerun</button></div>
+      <p class="sub">地图输出至 maps/&lt;名称&gt;.pc2.lcm，原始录制为 maps/&lt;名称&gt;.db。结束采集或「优化并导出」都会重跑 PGO（约数分钟），写入新文件，不覆盖原图，完成后地图列表自动刷新。</p>
+    </div>
+    <div class="card">
+      <h2>连接与网络</h2>
       <div class="row">
         <div><label for="mode">设备模式</label><select id="mode"><option value="simulation">仿真（MuJoCo）</option><option value="real">真机（Unitree WebRTC）</option></select></div>
         <div><label for="robotIp">Go2 IP（真机必填）</label><input id="robotIp" placeholder="例如 192.168.123.161"></div>
       </div>
-      <div class="notice">真机只上电会趴着。点击「启动采图」后，Orin 上的 DimOS 会通过 WebRTC 连接 192.168.123.161 并 StandUp；再用 Command Center 摇杆低速行走。急停必须在手边，周围清空。可视化必须经本机隧道打开（调度台链接 → 127.0.0.1:7779/9878），不要直接开 Orin:7779 首页（iframe 写死 localhost 会 refused）。退出：调度台终端 Ctrl+C；Orin 上停 agent；采图/巡检先点结束再关程序。</div>
-    </div>
-    <div class="card">
-      <h2>当前作业状态</h2>
-      <div id="linkStatus" class="status"><i class="dot"></i><span>正在连接 Orin robot agent…</span></div>
       <div id="wifiStatus" class="status"><i class="dot"></i><span>Orin WiFi：检测中…</span></div>
-      <div id="mappingStatus" class="status"><i class="dot"></i><span>采图：空闲</span></div>
-      <div id="patrolStatus" class="status"><i class="dot"></i><span>巡检：空闲</span></div>
-      <div id="dogPose" class="sub">狗在地图上：尚未锁定</div>
-      <div id="fireAlarmStatus" class="status"><i class="dot"></i><span>火情信号：NaN（未接入）</span></div>
-      <div class="row" style="align-items:end;margin-top:8px">
+      <div class="row" style="align-items:end">
         <div><label for="wifiProfile">Orin 首选 WiFi（开机自动连）</label><select id="wifiProfile"></select></div>
-        <div class="actions" style="margin-top:0">
-          <button id="wifiPrefer" class="secondary">设为开机首选</button>
-          <button id="wifiConnect" class="primary">立即连接</button>
-        </div>
+        <div class="actions" style="margin-top:0"><button id="wifiPrefer" class="secondary">设为开机首选</button><button id="wifiConnect" class="primary">立即连接</button></div>
       </div>
       <p class="sub" id="wifiHint">仓库到场后选仓库 WiFi →「设为开机首选」；重启后会在该 SSID 可见时自动连接。首次需在 Orin 上执行一次 sudo 安装。</p>
-      <div class="row"><div><label>采图 / 巡检运行日志</label><pre id="log">等待任务启动…</pre></div><div><label>巡检进度</label><pre id="progress">暂无活动任务</pre></div></div>
-    </div>
-  </section>
-  <section class="columns" style="margin-top:18px">
-    <div class="stack">
-      <div class="card">
-        <h2>① 远程采图建图</h2>
-        <p class="sub">日常快采仍可用这里。定位级重采请用独立建图台：上位机 <code>./start_mapping_console.sh</code> → <code>http://127.0.0.1:7782/</code>（限速约 0.25 m/s，导出 .pc2.lcm + .map.db）。</p>
-          <label for="mapName">地图名称</label><input id="mapName" value="warehouse">
-        <div class="actions"><button id="startMapping" class="primary">启动采图</button><button id="stopMapping" class="stop">结束采集并导出地图</button></div>
-        <div class="status"><i class="dot"></i><span>采图控制：<a href="/command-center" target="_blank" rel="noreferrer">Command Center</a> · <a href="/rerun" target="_blank" rel="noreferrer">Rerun 点云/图像</a> · <button type="button" id="openViz" class="secondary" style="min-height:32px;padding:4px 10px">重新打开可视化</button>（点启动会自动开 Rerun；查看器程序走本机缓存）</span></div>
-        <p class="sub">地图输出至 maps/&lt;名称&gt;.pc2.lcm；原始录制保存为 maps/&lt;名称&gt;.db。结束采集或点「优化并导出」都会强制重跑 PGO（约数分钟），完成后刷新地图列表。</p>
-      </div>
-      <div class="card">
-        <h2>② 巡检任务设置</h2>
-        <div><label for="routeSelect">加载巡检路线</label><div style="display:flex;gap:6px"><select id="routeSelect"></select><button id="loadRoute" class="secondary">加载</button></div></div>
-        <div class="status"><i class="dot"></i><span id="selectedMapSummary">巡检将使用地图工作区当前选中的地图</span></div>
-        <div class="row3">
-          <div><label for="executionMode">启动方式</label><select id="executionMode"><option value="immediate">立即开始</option><option value="daily">预约一次（下次到该时刻）</option></select></div>
-          <div><label for="duration">本次任务时长 (min)</label><input id="duration" type="number" min="1" value="30"></div>
-          <div><label for="cycleMode">运行轮次</label><select id="cycleMode"><option value="repeat" selected>持续循环至任务时长</option><option value="single">只运行一轮</option></select></div>
-        </div>
-        <div id="repeatIntervalWrap"><label for="repeat">循环间隔 (min)</label><input id="repeat" type="number" min="0" value="0"><p class="sub">持续循环模式下，0 表示本轮结束后立即开始下一轮；大于 0 表示等待指定分钟再开始。</p></div>
-        <div class="row">
-          <div><label for="speedMode">巡检速度</label><select id="speedMode"><option value="slow" selected>慢速（当前 0.35 m/s）</option><option value="fast">快速（0.70 m/s）</option><option value="custom">自定义</option></select></div>
-          <div id="customSpeedWrap" class="hidden"><label for="speedMps">自定义速度 (m/s，最大 1)</label><input id="speedMps" type="number" min="0.05" max="1" step="0.05" value="0.5"></div>
-        </div>
-        <p class="sub" id="speedHint">点「确认位姿并开始行走」时锁定。这次行走过程中不能再改，任务结束后才能重选。</p>
-        <div id="dailyTimeWrap" class="hidden"><label for="startAt">本次预约时刻</label><input id="startAt" type="time"></div>
-        <div class="row">
-          <div><label for="defaultDwell">新增巡检点停留 (s)</label><input id="defaultDwell" type="number" min="0" value="10"></div>
-          <div><label for="mapPose">真机初始位姿 x,y,yaw（loaded map 坐标系，米、弧度）</label><input id="mapPose" value="0,0,0" placeholder="例 1.2,-1.2,-1.0"><p class="sub">这是狗在 loaded map 坐标系里的位置和朝向，与巡检点同一套坐标。不是里程计，也不是世界坐标。yaw 用弧度。推荐把狗放在建图起点、朝向与建图开始时一致，填 0,0,0。</p></div>
-        </div>
-        <div class="actions"><button id="startPatrol" class="primary">确认并启动巡检</button><button id="confirmPose" class="primary">确认位姿并开始行走</button><button id="pausePatrol" class="secondary">火情 / 异常：暂停</button><button id="resumePatrol" class="secondary">确认现场安全并继续</button><button id="haltPatrol" class="stop">立刻停下</button><button id="stopPatrol" class="stop">结束巡检并返航</button></div>
-        <div><label>定位微调（锁定后、确认前，在 loaded map 坐标系里移动狗的位置）</label><div class="actions"><select id="nudgeStep"><option value="0.05,1">5 cm / 1°</option><option value="0.2,5">20 cm / 5°</option></select><button class="secondary" data-nudge="1,0,0">x +</button><button class="secondary" data-nudge="-1,0,0">x −</button><button class="secondary" data-nudge="0,1,0">y +</button><button class="secondary" data-nudge="0,-1,0">y −</button><button class="secondary" data-nudge="0,0,1">朝向 + （逆时针）</button><button class="secondary" data-nudge="0,0,-1">朝向 − （顺时针）</button></div><p class="sub">每点一次，地图在 Rerun 里跟着移动。点云和代价地图重合后再点「确认位姿并开始行走」。</p></div>
-        <p class="sub">立刻停下：取消导航，不返航，断开控制，狗会趴下。带线测试时用这个。结束巡检并返航会先走回出发点，最多等三分钟，线牵着时不要点。火情暂停只是原地站住，任务还在。</p>
-      </div>
-    </div>
-    <div class="card">
-      <h2>地图工作区 · 地图检查与巡检路线编辑</h2>
-      <div class="row">
-        <div><label for="mapSelect">当前地图</label><div style="display:flex;gap:6px;flex-wrap:wrap"><select id="mapSelect"></select><button id="refreshMaps" class="secondary">刷新</button><button id="exportMap" class="primary">优化并导出</button></div></div>
-        <div class="status" style="align-self:end"><i class="dot"></i><span id="mapStats">选择地图后显示点云信息</span></div>
-      </div>
-      <p class="sub">「优化并导出」用录制 .db 重跑定位级 PGO，写入新文件（如 1st_floor_1.pc2.lcm），不覆盖原图。采图中请先结束采集；导出中状态栏会显示「PGO 导图中」。</p>
-      <div class="row" style="margin-top:10px;align-items:end">
-        <div><label for="routeName">保存路线名称</label><input id="routeName" value="warehouse-patrol"></div>
-        <div class="actions" style="margin-top:0"><button id="setStart" class="secondary">设置唯一出发 / 返回点</button><button id="addKeepout" class="secondary">添加禁区（四边形）</button><button id="clearKeepout" class="secondary">清除禁区</button><button id="optimizeRoute" class="secondary">优化巡检顺序</button><button id="saveRoute" class="primary">保存路线</button></div>
-      </div>
-      <p id="message" role="status"></p>
-      <p class="sub">画布是地图的 XY 俯视点云投影。左键添加巡检点；先点“设置唯一出发 / 返回点”再左键设置起点；右键删除最近巡检点。点“添加禁区”后依次点四个角，框内视为障碍。点“清除禁区”后保存路线，禁区才会从任务里去掉。</p>
-      <div class="map-wrap"><canvas id="mapCanvas" width="1000" height="650"></canvas></div>
-      <div class="legend"><span><b style="background:#187a52"></b>唯一出发 / 返回点</span><span><b style="background:#e25832"></b>巡检点及顺序</span><span><b style="background:#6b4c9a"></b>禁区</span><span><b style="background:#9aa7a0"></b>地面(~低)</span><span><b style="background:#c45c26"></b>障碍/墙(~高)</span></div>
-      <div class="table-wrap"><table><thead><tr><th>#</th><th>X (m)</th><th>Y (m)</th><th>停留 (s)</th><th></th></tr></thead><tbody id="waypointRows"></tbody></table></div>
+      <div class="notice">真机只上电会趴着，启动采图或巡检后 Orin 上的 DimOS 才通过 WebRTC 连狗并站起。急停必须在手边，周围清空。可视化必须经本机隧道打开（页面顶部的链接），不要直接开 Orin:7779。退出：先在页面上结束采图 / 巡检，再在调度台终端 Ctrl+C。</div>
     </div>
   </section>
 </main>
+<p id="message" role="status"></p>
 <script>
 const $=id=>document.getElementById(id), canvas=$('mapCanvas'),ctx=canvas.getContext('2d');
 // This is the remote operator console: all robot actions go through the Orin agent.
@@ -152,7 +220,6 @@ function canvasPoint(event){const rect=canvas.getBoundingClientRect(),scaleX=can
 canvas.oncontextmenu=e=>e.preventDefault();canvas.onmousedown=e=>{if(!bounds)return;if(e.button===2){if(keepoutDraft.length)keepoutDraft.pop();else if((route.keepouts||[]).length)route.keepouts.pop();else route.waypoints.pop()}else if(e.button===0){const p=canvasPoint(e);if(keepoutDraft.length||$('addKeepout').dataset.on==='1'){keepoutDraft.push(p);if(keepoutDraft.length===4){(route.keepouts=route.keepouts||[]).push({points:keepoutDraft.splice(0)});$('addKeepout').dataset.on='';$('addKeepout').textContent='添加禁区（四边形）'}}else if(chooseStart){route.return_to_start=p;chooseStart=false;$('setStart').textContent='设置唯一出发 / 返回点'}else route.waypoints.push({...p,dwell_s:+$('defaultDwell').value})}draw()};
 $('waypointRows').oninput=e=>{const i=Number(e.target.dataset.index),field=e.target.dataset.field;if(Number.isInteger(i)&&field){route.waypoints[i][field]=Number(e.target.value);draw()}};$('waypointRows').onclick=e=>{if(e.target.dataset.remove!==undefined){route.waypoints.splice(Number(e.target.dataset.remove),1);draw()}};
 async function loadMapPoints(){const name=$('mapSelect').value;if(!name)return;message('正在加载点云地图…');const response=await fetch('/api/map-points?map='+encodeURIComponent(name));const data=await response.json();if(!response.ok){message(data.error||'地图加载失败',true);return}const rows=Array.isArray(data)?data:(data.points||[]);cloud=rows.map(p=>p.length>=3?p:[p[0],p[1],0]);const xs=cloud.map(p=>p[0]),ys=cloud.map(p=>p[1]),zs=cloud.map(p=>p[2]).filter(Number.isFinite);bounds={minX:Math.min(...xs),maxX:Math.max(...xs),minY:Math.min(...ys),maxY:Math.max(...ys)};draw();const width=(bounds.maxX-bounds.minX).toFixed(1),height=(bounds.maxY-bounds.minY).toFixed(1);const zSpan=zs.length?`${Math.min(...zs).toFixed(2)}~${Math.max(...zs).toFixed(2)} m`:'n/a';$('mapStats').textContent=`${name} · ${cloud.length.toLocaleString()} 点 · XY ${width}×${height} m · Z ${zSpan}`;$('selectedMapSummary').textContent=`巡检使用地图：${name}`;message(`地图已加载：${cloud.length.toLocaleString()} 点（按高度着色：灰绿=地面，橙=障碍）`)}
-async function refreshLists(){const oldMap=$('mapSelect').value,oldRoute=$('routeSelect').value;const [mapsPayload,routesPayload]=await Promise.all([fetch('/api/maps').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);const maps=Array.isArray(mapsPayload)?mapsPayload:[];const routes=Array.isArray(routesPayload)?routesPayload:[];if(!Array.isArray(mapsPayload)&&mapsPayload.error)message(mapsPayload.error,true);$('mapSelect').innerHTML=maps.map(n=>`<option>${n}</option>`).join('');$('routeSelect').innerHTML=routes.map(n=>`<option>${n}</option>`).join('');if(maps.includes(oldMap))$('mapSelect').value=oldMap;else if(maps.includes('warehouse.pc2.lcm'))$('mapSelect').value='warehouse.pc2.lcm';if(routes.includes(oldRoute))$('routeSelect').value=oldRoute;else if(routes.includes('warehouse-patrol.json'))$('routeSelect').value='warehouse-patrol.json';if(maps.length)await loadMapPoints()}
 async function loadRoute(){const data=await fetch('/api/route?name='+encodeURIComponent($('routeSelect').value)).then(r=>r.json());if(data.error){message(data.error,true);return}route={return_to_start:data.return_to_start||null,waypoints:data.waypoints||[],keepouts:data.keepouts||[]};keepoutDraft=[];$('routeName').value=$('routeSelect').value.replace(/\.json$/,'');$('startAt').value=data.start_at||'';$('executionMode').value=data.start_at?'daily':'immediate';updateExecutionMode();$('duration').value=(data.max_duration_s||1800)/60;$('repeat').value=(data.repeat_interval_s||0)/60;draw();message('路线已加载')}
 function routePayload(){return{...route,return_to_start:route.return_to_start,waypoints:route.waypoints}}
 function routeDistance(points){const home=route.return_to_start;if(!home)return NaN;let total=0,previous=home;for(const point of points){total+=Math.hypot(point.x-previous.x,point.y-previous.y);previous=point}return total+Math.hypot(home.x-previous.x,home.y-previous.y)}
@@ -177,7 +244,11 @@ $('wifiPrefer').onclick=async()=>{const profile=$('wifiProfile').value;if(!profi
 $('wifiConnect').onclick=async()=>{const profile=$('wifiProfile').value;if(!profile){message('请选择 WiFi 配置',true);return}message(`正在切换 Orin WiFi → ${profile}…`);const response=await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile})});const data=await response.json().catch(()=>({}));message(response.ok?`已请求连接 ${profile}`:(data.error||'连接失败'),!response.ok)};
 $('startPatrol').onclick=async()=>{if($('executionMode').value==='daily'&&!$('startAt').value){message('请选择本次预约时刻。',true);return}const rerunTab=openRerunTab();vizOpenedForRun=true;if(!await $('saveRoute').onclick()){if(rerunTab)rerunTab.close();vizOpenedForRun=false;return}const response=await fetch('/api/patrol/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map:$('mapSelect').value,route:$('routeSelect').value,mode:$('mode').value,robot_ip:$('robotIp').value,initial_pose:$('mapPose').value,execution_mode:$('executionMode').value,start_at:$('executionMode').value==='daily'?$('startAt').value:'',max_duration_s:+$('duration').value*60,repeat_enabled:$('cycleMode').value==='repeat',repeat_interval_s:+$('repeat').value*60})});const data=await response.json();if(!response.ok&&rerunTab){rerunTab.close();vizOpenedForRun=false}message(response.ok?'巡检已启动，Rerun 已在新页面打开。定位锁定后确认墙重合，再点「确认位姿并开始行走」。':data.error,!response.ok)};
 $('speedMode').onchange=()=>{$('customSpeedWrap').classList.toggle('hidden',$('speedMode').value!=='custom')};
-$('confirmPose').onclick=async()=>{const response=await fetch('/api/patrol/confirm-pose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed_mode:$('speedMode').value,speed_mps:+$('speedMps').value})});const data=await response.json();if(response.ok){$('speedMode').disabled=true;$('speedMps').disabled=true}message(response.ok?`已确认位姿，行走速度锁定为 ${data.mps} m/s。`:(data.error||'确认失败'),!response.ok)};
+let poseEdited=false;$('mapPose').addEventListener('input',()=>{poseEdited=true});
+function validPose(pose){return !!pose&&/^-?\d+(\.\d+)?,-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(pose)}
+function applyInitialPose(pose){if(poseEdited||!validPose(pose))return;$('mapPose').value=pose;try{localStorage.setItem('dimosInitialPose',pose)}catch(e){}}
+fetch('/api/initial-pose').then(r=>r.json()).then(d=>{if(!validPose(d.initial_pose)){try{applyInitialPose(localStorage.getItem('dimosInitialPose'))}catch(e){return}return}applyInitialPose(d.initial_pose)}).catch(()=>{try{applyInitialPose(localStorage.getItem('dimosInitialPose'))}catch(e){}});
+$('confirmPose').onclick=async()=>{const response=await fetch('/api/patrol/confirm-pose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed_mode:$('speedMode').value,speed_mps:+$('speedMps').value})});const data=await response.json();if(response.ok){$('speedMode').disabled=true;$('speedMps').disabled=true;if(data.initial_pose){$('mapPose').value=data.initial_pose;try{localStorage.setItem('dimosInitialPose',data.initial_pose)}catch(e){}}}message(response.ok?(data.initial_pose?`已确认位姿，行走速度锁定为 ${data.mps} m/s。下次默认初始位姿 ${data.initial_pose}`:`已确认位姿，行走速度锁定为 ${data.mps} m/s。当前还没有锁定地图位姿，输入框未改。`):(data.error||'确认失败'),!response.ok)};
 document.querySelectorAll('[data-nudge]').forEach(button=>{button.onclick=async()=>{const [m,deg]=$('nudgeStep').value.split(',').map(Number);const [sx,sy,sr]=button.dataset.nudge.split(',').map(Number);const response=await fetch('/api/patrol/nudge-pose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dx:sx*m,dy:sy*m,dyaw_deg:sr*deg})});const data=await response.json();message(response.ok?`已微调 dx=${(sx*m).toFixed(2)} m, dy=${(sy*m).toFixed(2)} m, 朝向 ${sr*deg}°`:data.error,!response.ok)}});
 async function patrolCommand(endpoint,successText){const response=await fetch(endpoint,{method:'POST'});const data=await response.json();message(response.ok?successText:data.error,!response.ok)}
 $('pausePatrol').onclick=()=>patrolCommand('/api/patrol/fire-alarm','已请求火情/异常暂停；机器人会停止当前导航并等待人工确认。');
@@ -185,7 +256,90 @@ $('resumePatrol').onclick=()=>patrolCommand('/api/patrol/resume','已确认现�
 $('haltPatrol').onclick=()=>patrolCommand('/api/patrol/halt','已急停：不返航，控制断开，狗会趴下。');
 $('stopPatrol').onclick=()=>patrolCommand('/api/patrol/stop','已请求结束；机器人将返航后关闭任务。');
 function setStatus(element,active,text,isError=false){element.querySelector('.dot').className='dot'+(isError?' error':active?' running':'');element.querySelector('span').textContent=text}
-async function pollStatus(){try{const response=await fetch('/api/status');const state=await response.json();if(!response.ok||state.error){setStatus($('linkStatus'),false,'上位机未连上 robot agent：'+(state.error||('HTTP '+response.status)),true);return}const robot=state.robot||{},conn=state.connectivity||{};const lidar=conn.lidar_reachable===true?'LiDAR 可达':(conn.lidar_ip?`LiDAR ${conn.lidar_ip} 未响应（DimOS 仍走 Go2 WebRTC）`:'');const vis=conn.command_center?'Command Center 已启动':(state.mapping&&state.mapping.running?'Command Center 启动中…':'Command Center 未启动（先点启动采图）');const hostLink=conn.orin_host_link?`Orin主机链路 ${conn.orin_host_link.iface}/${conn.orin_host_link.ip}`:(conn.orin_dog_lan?`Orin狗内网 ${conn.orin_dog_lan.ip}`:'');setStatus($('linkStatus'),true,`已连接 Orin agent${hostLink?' · '+hostLink:''} · 狗MCU ${robot.robot_ip||''} ${conn.robot_reachable?'可达':'不可达'} · ${lidar} · ${vis}`,conn.robot_reachable===false||!conn.command_center);renderWifi(state.wifi||{});const exp=state.mapping&&state.mapping.export||{};if(exp.running&&!exportPendingName)exportPendingName=(exp.name||'')+'.pc2.lcm';const mapText={recording:'采集中 · LiDAR / odom / camera 正在录制',exporting:`PGO 导图中${exp.name?` → ${exp.name}.pc2.lcm`:''}`,map_ready:exp.name?`地图已导出：${exp.name}.pc2.lcm`:'地图已导出',idle:'采图：空闲'};const mapBusy=!!(state.mapping&&(state.mapping.running||exp.running));setStatus($('mappingStatus'),mapBusy,state.mapping.running?mapText.recording:(exp.running?mapText.exporting:(mapText[state.mapping.phase]||mapText.idle)),!!exp.error);if(state.mapping&&state.mapping.running&&conn.command_center&&conn.rerun&&!vizOpenedForRun)openVizTabs();if(!(state.mapping&&state.mapping.running))vizOpenedForRun=false;if(exportPendingName&&exp.running===false&&exp.path&&!exp.error){const done=exportPendingName;exportPendingName='';refreshLists().then(()=>{if([...$('mapSelect').options].some(o=>o.value===done))$('mapSelect').value=done;return loadMapPoints()}).then(()=>message(`优化导出完成：${done}`));}const fire=state.fire_alarm||{state:'NaN',events:[]};const lastFire=fire.events?.at(-1);setStatus($('fireAlarmStatus'),fire.state==='Fire_alarm',`火情信号：${fire.state}${lastFire?.timestamp?` · ${lastFire.timestamp}`:''}${fire.source?` · ${fire.source}`:''}`,fire.state==='Fire_alarm');const p=state.patrol||{};const active=p.running||['localizing','initializing','waiting_for_localization','waiting_for_start','scheduled','navigating','dwell','returning','waiting','paused_fire'].includes(p.phase);setStatus($('patrolStatus'),active,`巡检：${p.phase||'idle'} · ${p.message||''}`,p.phase==='error');{const d=p.dog_pose;$('dogPose').textContent=d?`狗在地图上：x=${d.x.toFixed(2)} m, y=${d.y.toFixed(2)} m, yaw=${d.yaw.toFixed(2)} rad (${(d.yaw*180/Math.PI).toFixed(1)}°) · 微调 ${d.nudge_seq} 次 · ${d.age_s}s 前`:'狗在地图上：尚未锁定'}const speedLocked=!!(p.walk_speed&&p.walk_speed.locked);$('speedMode').disabled=speedLocked;$('speedMps').disabled=speedLocked;if(speedLocked&&p.walk_speed.mode){$('speedMode').value=p.walk_speed.mode;if(p.walk_speed.mps)$('speedMps').value=p.walk_speed.mps;$('customSpeedWrap').classList.toggle('hidden',p.walk_speed.mode!=='custom')}const tf=p.map_to_world,align=tf?`Map→World: Δx=${tf.translation[0].toFixed(2)}m Δy=${tf.translation[1].toFixed(2)}m`:'Map→World: 等待定位';$('progress').textContent=[`阶段：${p.phase||'idle'}`,`周期：${p.cycle||0}`,`点位：${p.index||0}/${p.total||0}`,p.x!==undefined?`目标地图坐标：(${p.x}, ${p.y})`:'',p.world_x!==undefined?`下发世界坐标：(${p.world_x.toFixed(2)}, ${p.world_y.toFixed(2)})`:'',align,`更新时间：${p.updated_at||'—'}`].filter(Boolean).join('\n');const logEl=$('log'),pinned=logEl.scrollTop+logEl.clientHeight>=logEl.scrollHeight-8;logEl.textContent=[...(state.mapping.log||[]),...(p.running?(p.log||[]):[])].slice(-40).join('\n')||'等待任务启动…';if(pinned)logEl.scrollTop=logEl.scrollHeight}catch(e){setStatus($('linkStatus'),false,'上位机未连上 robot agent：'+e,true);$('log').textContent=String(e)}}
+// Maps and routes arrive newest first; the newest is the default.
+async function refreshLists(){
+  const oldMap=$('mapSelect').value,oldRoute=$('routeSelect').value;
+  const [mapsPayload,routesPayload]=await Promise.all([fetch('/api/maps').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);
+  const maps=Array.isArray(mapsPayload)?mapsPayload:[],routes=Array.isArray(routesPayload)?routesPayload:[];
+  if(!Array.isArray(mapsPayload)&&mapsPayload.error)message(mapsPayload.error,true);
+  const options=names=>names.map((n,i)=>`<option value="${n}">${n}${i===0?'（最新）':''}</option>`).join('');
+  $('mapSelect').innerHTML=options(maps);$('routeSelect').innerHTML=options(routes);
+  if(maps.includes(oldMap))$('mapSelect').value=oldMap;
+  if(routes.includes(oldRoute))$('routeSelect').value=oldRoute;
+  if(maps.length)await loadMapPoints();
+}
+const PHASES={
+  idle:['空闲','idle'],initializing:['正在启动','wait'],localizing:['正在定位','wait'],waiting_for_localization:['等待定位锁定','wait'],
+  localized:['定位已锁定','wait'],awaiting_pose_confirm:['等待确认位姿 · 核对后点「确认位姿并开始行走」','wait'],waiting_for_start:['等待确认位姿 · 核对后点「确认位姿并开始行走」','wait'],
+  waiting_for_costmap:['等待代价地图','wait'],scheduled:['已预约 · 等待开始时刻','wait'],running:['巡检中','run'],navigating:['巡检中 · 前往巡检点','run'],
+  dwell:['巡检中 · 在巡检点停留检查','run'],returning:['返回出发点','run'],waiting:['等待下一轮','wait'],paused_fire:['火情 / 异常暂停 · 原地等待人工确认','alarm'],
+  completed:['任务完成 · 已回到出发点','done'],stopped:['已停止','idle'],error:['出错','alarm']};
+const EVENTS={navigate:'前往',reached:'到达',duration_finish_round:'时长已到，走完本圈',battery_return:'电量低，返航',return_home:'返回出发点',finished:'任务结束'};
+const ACTIVE=['localizing','initializing','waiting_for_localization','localized','awaiting_pose_confirm','waiting_for_costmap','waiting_for_start','scheduled','running','navigating','dwell','returning','waiting','paused_fire'];
+const PAGE_TITLE=document.title;
+function clock(iso){const d=new Date(iso);return iso&&!isNaN(d)?d.toLocaleTimeString('zh-CN',{hour12:false}):''}
+function setPhase(text,kind,detail){$('phaseBox').className='phase '+kind;$('phaseBig').textContent=text;$('phaseDetail').textContent=detail||''}
+function offline(reason){const dropped=/unavailable|timed out|No route|unreachable|refused|Network/i.test(String(reason));setStatus($('linkStatus'),false,dropped?'与 Orin 的网络断了，页面停在断线前。狗上的任务还在跑，日志在 Orin 的 logs/ 里；网络恢复后会自动补到本机。':'上位机未连上 robot agent：'+reason,true);setPhase('未连上机器狗','alarm',dropped?'热点或网线中断。本页不再更新，下面的记录是断线前收到的最后内容。':'状态已停止更新，请检查网络和 Orin 上的 robot agent。')}
+async function pollStatus(){
+  try{
+    const response=await fetch('/api/status');const state=await response.json();
+    if(!response.ok||state.error){offline(state.error||('HTTP '+response.status));return}
+    const robot=state.robot||{},conn=state.connectivity||{},mapping=state.mapping||{},p=state.patrol||{};
+    const hostLink=conn.orin_host_link?`Orin 链路 ${conn.orin_host_link.iface}/${conn.orin_host_link.ip}`:(conn.orin_dog_lan?`Orin 狗内网 ${conn.orin_dog_lan.ip}`:'');
+    const lidar=conn.lidar_reachable===true?'LiDAR 可达':'';
+    const clock=state.clock||{},skew=clock.epoch?Math.round(Date.now()/1000-clock.epoch):null;
+    const clockText=skew==null?'':`时钟差 ${skew}s${clock.timezone&&clock.timezone!=='Asia/Shanghai'?' · 时区 '+clock.timezone:''}${state.clock_sync&&state.clock_sync.result&&state.clock_sync.result.ok===false?' · 对时失败，需在 Orin 执行 sudo ./scripts/orin_timesync.sh install':''}`;
+    setStatus($('linkStatus'),true,['已连接 Orin',hostLink,`狗 ${robot.robot_ip||''} ${conn.robot_reachable?'可达':'不可达'}`,lidar,conn.command_center?'可视化已启动':'可视化未启动',clockText].filter(Boolean).join(' · '),conn.robot_reachable===false||(skew!=null&&Math.abs(skew)>=5));
+    renderWifi(state.wifi||{});
+
+    const exp=mapping.export||{};
+    if(exp.running&&!exportPendingName)exportPendingName=(exp.name||'')+'.pc2.lcm';
+    const mapText={recording:'采集中 · LiDAR / odom / camera 正在录制',exporting:`PGO 导图中${exp.name?` → ${exp.name}.pc2.lcm`:''}`,map_ready:exp.name?`地图已导出：${exp.name}.pc2.lcm`:'地图已导出',idle:'采图：空闲'};
+    setStatus($('mappingStatus'),!!(mapping.running||exp.running),mapping.running?mapText.recording:(exp.running?mapText.exporting:(mapText[mapping.phase]||mapText.idle)),!!exp.error);
+    if(exportPendingName&&exp.running===false&&exp.path&&!exp.error){const done=exportPendingName;exportPendingName='';refreshLists().then(()=>{if([...$('mapSelect').options].some(o=>o.value===done))$('mapSelect').value=done;return loadMapPoints()}).then(()=>message(`优化导出完成：${done}`))}
+
+    // Fire alarm: the whole page flashes until the operator confirms the scene is safe.
+    const fire=state.fire_alarm||{state:'NaN',events:[]},lastFire=(fire.events||[]).at(-1),alarm=fire.state==='Fire_alarm';
+    const fireWhen=clock(lastFire&&lastFire.timestamp),patrolLive=!!p.running||ACTIVE.includes(p.phase);
+    document.body.classList.toggle('alarm',alarm);document.title=alarm?'【火情警报】'+PAGE_TITLE:PAGE_TITLE;
+    $('alarmText').textContent=`${patrolLive?'机器狗已原地停下，任务保留。':'当前没有巡检在运行；警报解除前新任务不会行走。'}来源：${fire.source||'未知'}${fireWhen?' · '+fireWhen:''}`;
+    $('tFire').textContent=alarm?'火情警报':(fire.state==='Safe'?'安全':'未接入');
+    $('tFireSub').textContent=fire.state==='NaN'?'探测器还没有上报过':`${fire.source||''}${fireWhen?' · '+fireWhen:''}`;
+    $('fireTile').classList.toggle('bad',alarm);
+
+    const known=PHASES[p.phase]||[p.phase||'空闲','idle'];
+    setPhase(alarm&&patrolLive?PHASES.paused_fire[0]:known[0],alarm&&patrolLive?'alarm':known[1],p.message||'');
+    $('tCycle').textContent=p.cycle?`第 ${p.cycle} 轮`:'—';
+    $('tCycleSub').textContent=p.task_log_name?`日志 logs/${p.task_log_name}`:'';
+    const total=p.total||0,index=Math.min(p.index||0,total);
+    $('tPoint').textContent=total?`${index} / ${total}`:'—';$('pointBar').style.width=total?`${100*index/total}%`:'0';
+    const soc=(state.battery||{}).soc,low=typeof soc==='number'&&soc<5;
+    $('tBattery').textContent=typeof soc==='number'?`${soc}%`:'未知';
+    $('tBatterySub').textContent=low?'低于 5%，正在回出发点':(soc==null?'狗未上报':'低于 5% 自动回出发点');
+    $('batteryTile').classList.toggle('bad',low);
+    const speedLocked=!!(p.walk_speed&&p.walk_speed.locked);
+    $('tSpeed').textContent=p.walk_speed&&p.walk_speed.mps?`${p.walk_speed.mps} m/s`:'—';
+    $('tUpdated').textContent=p.updated_at?`状态更新于 ${clock(p.updated_at)}`:'';
+    const d=p.dog_pose;
+    $('tPose').textContent=d?`x ${d.x.toFixed(2)} · y ${d.y.toFixed(2)} m`:'尚未锁定';
+    $('tPoseSub').textContent=d?`朝向 ${(d.yaw*180/Math.PI).toFixed(1)}° (${d.yaw.toFixed(2)} rad) · ${d.age_s}s 前`:'';
+    $('speedMode').disabled=speedLocked;$('speedMps').disabled=speedLocked;
+    if(speedLocked&&p.walk_speed.mode){$('speedMode').value=p.walk_speed.mode;if(p.walk_speed.mps)$('speedMps').value=p.walk_speed.mps;$('customSpeedWrap').classList.toggle('hidden',p.walk_speed.mode!=='custom')}
+
+    const taskLines=(Array.isArray(p.task_log)?p.task_log:[]).slice(-40).map(e=>{
+      const where=e.waypoint_id?`点${e.waypoint_id}`:'',xy=e.x!=null?`(${Number(e.x).toFixed(2)}, ${Number(e.y).toFixed(2)})`:'';
+      const round=e.cycle?`第${e.cycle}轮`:'',flame=e.fire==='Fire_alarm'?'火情警报':'',power=typeof e.soc==='number'?`电量${e.soc}%`:'';
+      return [clock(e.t),round,EVENTS[e.event]||e.event||'',where,xy,flame,power].filter(Boolean).join(' ')});
+    const tf=p.map_to_world;
+    const progressEl=$('progress'),progressPinned=progressEl.scrollTop+progressEl.clientHeight>=progressEl.scrollHeight-8;
+    progressEl.textContent=[p.x!==undefined?`当前目标（地图坐标）：(${p.x}, ${p.y})`:'',tf?`地图相对里程计偏移：Δx ${tf.translation[0].toFixed(2)} m, Δy ${tf.translation[1].toFixed(2)} m`:'',taskLines.length?'————':''].filter(Boolean).concat(taskLines).join('\n')||'暂无活动任务';
+    if(progressPinned)progressEl.scrollTop=progressEl.scrollHeight;
+    const logEl=$('log'),pinned=logEl.scrollTop+logEl.clientHeight>=logEl.scrollHeight-8;
+    logEl.textContent=[...(mapping.log||[]),...(p.log||[])].slice(-60).join('\n')||'等待任务启动…';
+    if(pinned)logEl.scrollTop=logEl.scrollHeight;
+  }catch(e){offline(String(e))}
+}
+$('alarmResume').onclick=()=>$('resumePatrol').onclick();
 updateCycleMode();
 refreshLists().then(()=>loadRoute());pollStatus();setInterval(pollStatus,2000);
 </script>

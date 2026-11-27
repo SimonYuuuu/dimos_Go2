@@ -26,9 +26,13 @@ export DIMOS_RELOC_SETTLE_N=3
 # 1: first lock is the typed initial pose (operator places the dog, then nudges
 # in the console). 0: lidar match against the loaded map.
 export DIMOS_RELOC_TRUST_HINT="${DIMOS_RELOC_TRUST_HINT:-1}"
-# Raw lidar + odometry for offline matcher tests; only the latest patrol is kept.
+# Raw lidar + odometry for offline matcher tests (scripts/reloc_field_track.py replays
+# them). The latest patrol and the one before it are kept, about 35 MB per minute each.
 export DIMOS_RELOC_RECORD_DIR="${DIMOS_RELOC_RECORD_DIR:-$ROOT/../robot_data/reloc-rec}"
-rm -rf "$DIMOS_RELOC_RECORD_DIR"
+rm -rf "$DIMOS_RELOC_RECORD_DIR.prev"
+if [[ -d "$DIMOS_RELOC_RECORD_DIR" ]]; then
+  mv "$DIMOS_RELOC_RECORD_DIR" "$DIMOS_RELOC_RECORD_DIR.prev"
+fi
 # Loaded map stays off the Rerun view. The live cloud is matched against it
 # in the background; global map and costmap remain.
 export DIMOS_SHOW_LOADED_MAP=0
@@ -48,6 +52,17 @@ RELOC_PREFIX="${DIMOS_RELOC_PREFIX:-lidarwindowrelocalization}"
 STATUS_FILE="${PATROL_STATUS_FILE:-$ROOT/maps/patrol-status.json}"
 TRANSFORM_FILE="${PATROL_TRANSFORM_FILE:-$ROOT/maps/map-to-world.json}"
 export PATROL_TRANSFORM_FILE="$TRANSFORM_FILE"
+# DimOS plans in this process. Without these, keepout quads stay off the costmap
+# and the shortcut planner cuts a straight line through them.
+export PATROL_KEEPOUT_FILE="${PATROL_KEEPOUT_FILE:-$ROOT/../robot_data/patrol-keepouts.json}"
+export PATROL_SPEED_FILE="${PATROL_SPEED_FILE:-$ROOT/../robot_data/patrol-speed.json}"
+export PATROL_BATTERY_FILE="${PATROL_BATTERY_FILE:-$ROOT/../robot_data/battery.json}"
+if [[ -z "${PATROL_TASK_LOG:-}" ]]; then
+  _route_stem="$(basename "$ROUTE" .json)"
+  _route_stem="${_route_stem//[^A-Za-z0-9._-]/_}"
+  mkdir -p "$ROOT/../logs"
+  export PATROL_TASK_LOG="$ROOT/../logs/patrol-$(date -u +%Y%m%d-%H%M%S)-${_route_stem}.jsonl"
+fi
 CONTROL_FILE="${PATROL_CONTROL_FILE:-$ROOT/maps/patrol-control.json}"
 LOG_FILE="${PATROL_DIMOS_LOG_FILE:-$ROOT/logs/patrol-dimos.log}"
 # 1 = keep DimOS/CC/Rerun up for pose checks; do not start waypoint navigation.
@@ -343,17 +358,19 @@ for _nav_patch in \
   apply_reloc_slow_correct_patch.py \
   apply_reloc_record_patch.py \
   apply_reloc_track_scan_patch.py \
-  apply_rerun_latest_only_patch.py
+  apply_reloc_field_track_patch.py \
+  apply_rerun_latest_only_patch.py \
+  apply_battery_file_patch.py
 do
   if [[ -f "$ROOT/../scripts/$_nav_patch" ]]; then
     "$ROOT/.venv/bin/python" "$ROOT/../scripts/$_nav_patch" >/dev/null 2>&1 || true
   fi
 done
 
-# A broken relocalize.py only logs errors while the patrol walks on odometry alone.
+# Broken relocalization code only logs errors while the patrol walks on odometry alone.
 if ! "$ROOT/.venv/bin/python" "$ROOT/../scripts/check_reloc_patch.py"; then
-  echo "relocalize.py failed its self-check; not starting the patrol." >&2
-  printf '{"phase":"error","message":"relocalize.py 补丁自检失败，定位会失效，见 patrol.log"}\n' > "$STATUS_FILE"
+  echo "Relocalization failed its self-check; not starting the patrol." >&2
+  printf '{"phase":"error","message":"定位补丁自检失败，定位会失效，见 patrol.log"}\n' > "$STATUS_FILE"
   exit 1
 fi
 

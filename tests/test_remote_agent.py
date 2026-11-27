@@ -44,6 +44,26 @@ class RemoteAgentFireSignalTests(unittest.TestCase):
                 self.assertEqual([record["state"] for record in records], ["Fire_alarm", "Safe"])
                 self.assertTrue(all(record["timestamp"] for record in records))
 
+    def test_operator_can_clear_an_alarm_that_arrived_with_no_patrol_running(self):
+        with tempfile.TemporaryDirectory() as temp:
+            control = Path(temp) / "control.json"
+            with (
+                patch.object(agent, "TOKEN", "unit-test-token"),
+                patch.object(agent, "CONTROL_FILE", control),
+                patch.object(agent, "EVENTS_FILE", Path(temp) / "events.jsonl"),
+                patch.object(agent, "patrol_proc", None),
+            ):
+                client = agent.app.test_client()
+                headers = {"Authorization": "Bearer unit-test-token"}
+                idle = client.post("/api/v1/patrol/resume", headers=headers)
+                self.assertEqual(idle.status_code, 409)
+                client.post("/api/v1/fire-signal", headers=headers, json={"state": "Fire_alarm"})
+                cleared = client.post("/api/v1/patrol/resume", headers=headers)
+                self.assertEqual(cleared.status_code, 200)
+                state = json.loads(control.read_text())
+                self.assertFalse(state["paused"])
+                self.assertEqual(state["fire_state"], "Safe")
+
     def test_token_comparison_rejects_different_length_secrets(self):
         with patch.object(agent, "TOKEN", "unit-test-token"):
             client = agent.app.test_client()

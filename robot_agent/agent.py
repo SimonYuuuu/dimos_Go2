@@ -140,6 +140,60 @@ def _patrol_log_for_ui() -> list[str]:
     return _tail(PATROL_LOG, 40) + _reloc_log_tail(50)
 
 
+def _battery() -> dict[str, Any]:
+    data = _read_json(DATA / "battery.json", {})
+    if not isinstance(data, dict):
+        return {"soc": None}
+    try:
+        soc = int(data["soc"])
+        age = round(max(0.0, time.time() - float(data.get("t", 0.0))), 1)
+    except (KeyError, TypeError, ValueError):
+        return {"soc": None}
+    if not 0 <= soc <= 100 or age > 30:
+        return {"soc": None, "age_s": age}
+    return {"soc": soc, "age_s": age, "low": soc < 5}
+
+
+def _task_log_tail(after: int = -1, limit: int = 400) -> tuple[str | None, list[dict[str, Any]], bool]:
+    """Events newer than ``after``. ``after < 0`` returns only the live tail.
+
+    The host console archives by seq. A dropped link used to lose every event
+    past the last 80 lines; passing the last seq it already has fills the gap
+    once the network returns. ``limit`` keeps one status response small.
+    """
+    meta = _read_json(DATA / "patrol-task.json", {})
+    if not isinstance(meta, dict):
+        return None, [], False
+    name = meta.get("name")
+    path = meta.get("path")
+    if not isinstance(name, str) or not isinstance(path, str):
+        return None, [], False
+    if after < 0:
+        lines = _tail(Path(path), 80)
+    else:
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        try:
+            seq = int(item.get("seq", -1))
+        except (TypeError, ValueError):
+            seq = -1
+        if after >= 0 and seq <= after:
+            continue
+        events.append(item)
+    more = len(events) > limit
+    return name, events[:limit], more
+
+
 def _running(proc: subprocess.Popen[bytes] | None) -> bool:
     return proc is not None and proc.poll() is None
 
@@ -587,16 +641,19 @@ def _clock_snapshot() -> dict[str, Any]:
     needs_install = not Path("/usr/local/sbin/dimos-orin-timesync").is_file()
     ntp = None
     synced = None
+    zone = None
     try:
         show = subprocess.run(
-            ["timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized", "--value"],
+            ["timedatectl", "show", "-p", "Timezone", "-p", "NTP", "-p", "NTPSynchronized", "--value"],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
         )
         lines = [ln.strip() for ln in (show.stdout or "").splitlines() if ln.strip()]
-        if len(lines) >= 2:
+        if len(lines) >= 3:
+            zone, ntp, synced = lines[0], lines[1], lines[2]
+        elif len(lines) >= 2:
             ntp, synced = lines[0], lines[1]
         elif len(lines) == 1:
             ntp = lines[0]
@@ -605,6 +662,7 @@ def _clock_snapshot() -> dict[str, Any]:
     return {
         "epoch": epoch,
         "utc": datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timezone": zone,
         "ntp": ntp,
         "synchronized": synced,
         "needs_install": needs_install,
@@ -643,6 +701,22 @@ def health():
     return jsonify(ok=True, service="dimos-go2-robot-agent", mode=DIMOS_MODE, robot_ip=ROBOT_IP)
 
 
+def _format_initial_pose(pose: object) -> str | None:
+    """x,y,yaw in the loaded-map frame, yaw wrapped to [-pi, pi]."""
+    if not isinstance(pose, dict):
+        return None
+    try:
+        x = float(pose["x"])
+        y = float(pose["y"])
+        yaw = float(pose["yaw"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x, y, yaw)):
+        return None
+    yaw = math.atan2(math.sin(yaw), math.cos(yaw))
+    return f"{x:.3f},{y:.3f},{yaw:.4f}"
+
+
 def _dog_pose() -> dict | None:
     pose = _read_json(DOG_POSE_FILE, None)
     if not isinstance(pose, dict) or not _running(patrol_proc):
@@ -658,6 +732,19 @@ def status():
     if not isinstance(control, dict):
         control = {}
     connectivity = _connectivity()
+    try:
+        task_after = int(request.args.get("task_after", "-1"))
+    except (TypeError, ValueError):
+        task_after = -1
+    task_name_filter = request.args.get("task_name", "")
+    meta_name = ""
+    meta = _read_json(DATA / "patrol-task.json", {})
+    if isinstance(meta, dict) and isinstance(meta.get("name"), str):
+        meta_name = meta["name"]
+    # A cursor from the previous task must not hide the new task's early events.
+    if task_name_filter and meta_name and task_name_filter != meta_name:
+        task_after = 0
+    task_name, task_events, task_more = _task_log_tail(task_after)
     return jsonify(
         robot={
             "mode": DIMOS_MODE,
@@ -698,7 +785,11 @@ def status():
             "reloc_log": _reloc_log_tail(50),
             "dog_pose": _dog_pose(),
             "walk_speed": _read_json(SPEED_FILE, {}) if _running(patrol_proc) else {},
+            "task_log_name": task_name,
+            "task_log": task_events,
+            "task_log_more": task_more,
         },
+        battery=_battery(),
         fire_alarm={
             "state": control.get("fire_state", "NaN"),
             "source": control.get("fire_source", "no signal connected"),
@@ -744,7 +835,9 @@ def fire_signal():
 
 @app.get("/api/v1/maps")
 def maps():
-    return jsonify(sorted(path.name for path in MAPS.glob("*.pc2.lcm")))
+    # Newest first: the console preselects the first entry.
+    found = sorted(MAPS.glob("*.pc2.lcm"), key=lambda path: (-path.stat().st_mtime, path.name))
+    return jsonify([path.name for path in found])
 
 
 @app.get("/api/v1/maps/<name>/points")
@@ -1101,6 +1194,19 @@ def start_patrol():
     with lock:
         if _running(mapping_proc) or _running(patrol_proc):
             return jsonify(error="Another robot task is already active."), 409
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        safe_route = re.sub(r"[^A-Za-z0-9._-]", "_", route_name)[:80] or "route"
+        task_log = PROJECT / "logs" / f"patrol-{stamp}-{safe_route}.jsonl"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            DATA / "patrol-task.json",
+            {
+                "name": task_log.name,
+                "path": str(task_log),
+                "route": route_name,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         env = os.environ.copy()
         env.pop("ROBOT_AGENT_TOKEN", None)
         env.pop("UNITREE_AES_128_KEY", None)
@@ -1118,6 +1224,10 @@ def start_patrol():
             PATROL_MAX_DURATION_S=str(max_duration_s),
             PATROL_REPEAT_INTERVAL_S=str(repeat_interval_s),
             PATROL_REPEAT_ENABLED="1" if repeat_enabled else "0",
+            PATROL_KEEPOUT_FILE=str(KEEPOUT_FILE),
+            PATROL_SPEED_FILE=str(SPEED_FILE),
+            PATROL_BATTERY_FILE=str(DATA / "battery.json"),
+            PATROL_TASK_LOG=str(task_log),
         )
         # Prefer explicit agent env; fall back to robot_agent/.env via start_patrol.sh.
         if os.environ.get("PATROL_LOCALIZE_ONLY"):
@@ -1273,7 +1383,11 @@ def pause_patrol():
 
 @app.post("/api/v1/patrol/resume")
 def resume_patrol():
-    if not _running(patrol_proc):
+    control = _read_json(CONTROL_FILE, {})
+    alarmed = isinstance(control, dict) and control.get("fire_state") == "Fire_alarm"
+    # An alarm that arrived with no patrol running must still be clearable,
+    # or the next patrol starts paused and the console keeps flashing.
+    if not _running(patrol_proc) and not alarmed:
         return jsonify(error="No patrol task is running."), 409
     _event("Safe", "remote operator", "Operator confirmed scene is safe")
     _control(paused=False)
@@ -1329,7 +1443,13 @@ def confirm_pose():
         return jsonify(error=str(error)), 400
     _write_json(SPEED_FILE, {"mps": mps, "locked": True, "mode": body.get("speed_mode", "slow")})
     _control(pose_confirmed=True)
-    return jsonify(ok=True, message="Pose confirmed; navigation may start.", mps=mps)
+    saved = _format_initial_pose(_read_json(DOG_POSE_FILE, None))
+    return jsonify(
+        ok=True,
+        message="Pose confirmed; navigation may start.",
+        mps=mps,
+        initial_pose=saved,
+    )
 
 
 @app.post("/api/v1/patrol/nudge-pose")

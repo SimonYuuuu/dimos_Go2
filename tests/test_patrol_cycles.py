@@ -1,8 +1,10 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -18,6 +20,9 @@ class FakeTransport:
     instances = {}
     goals = []
     costmap_available = True
+    n = 0
+    delay_s = 0.0
+    delay_on = 0
 
     def __init__(self, topic, _message_type):
         self.topic = topic
@@ -32,8 +37,11 @@ class FakeTransport:
 
     def broadcast(self, _channel, message):
         if self.topic == "goal_request":
+            FakeTransport.n += 1
             position = message.position
             FakeTransport.goals.append((round(float(position.x), 2), round(float(position.y), 2)))
+            if FakeTransport.delay_s and FakeTransport.n == FakeTransport.delay_on:
+                time.sleep(FakeTransport.delay_s)
             for callback in FakeTransport.instances["goal_reached"].callbacks:
                 callback(Bool(data=True))
 
@@ -43,6 +51,9 @@ class PatrolCycleTests(unittest.TestCase):
         FakeTransport.instances = {}
         FakeTransport.goals = []
         FakeTransport.costmap_available = costmap_available
+        FakeTransport.n = 0
+        FakeTransport.delay_s = 0.0
+        FakeTransport.delay_on = 0
         with tempfile.TemporaryDirectory() as temp:
             control = Path(temp) / "control.json"
             status = Path(temp) / "status.json"
@@ -79,6 +90,64 @@ class PatrolCycleTests(unittest.TestCase):
         self.assertEqual(goals, [])
         self.assertEqual(status["phase"], "error")
         self.assertIn("No valid /global_costmap", status["message"])
+
+    def test_duration_finishes_the_open_round_before_going_home(self):
+        FakeTransport.instances = {}
+        FakeTransport.goals = []
+        FakeTransport.costmap_available = True
+        FakeTransport.n = 0
+        FakeTransport.delay_s = 0.25
+        FakeTransport.delay_on = 2
+        with tempfile.TemporaryDirectory() as temp:
+            control = Path(temp) / "control.json"
+            status_path = Path(temp) / "status.json"
+            control.write_text(json.dumps({"paused": False, "stop_requested": False}))
+            with patch.object(patrol, "make_transport", FakeTransport), contextlib.redirect_stdout(io.StringIO()):
+                patrol.run_patrol(
+                    [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+                    (0.0, 0.0),
+                    0.05,
+                    0.0,
+                    status_path,
+                    None,
+                    control,
+                    True,
+                )
+            goals = list(FakeTransport.goals)
+            status = json.loads(status_path.read_text())
+        self.assertEqual(goals, [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (0.0, 0.0)])
+        self.assertEqual(status["phase"], "completed")
+        self.assertIn("本圈", status["message"])
+
+    def test_low_battery_returns_home_without_more_waypoints(self):
+        with tempfile.TemporaryDirectory() as temp:
+            battery = Path(temp) / "battery.json"
+            battery.write_text(json.dumps({"soc": 4, "t": time.time()}))
+            control = Path(temp) / "control.json"
+            status_path = Path(temp) / "status.json"
+            control.write_text(json.dumps({"paused": False, "stop_requested": False}))
+            FakeTransport.instances = {}
+            FakeTransport.goals = []
+            FakeTransport.costmap_available = True
+            FakeTransport.n = 0
+            FakeTransport.delay_s = 0.0
+            with patch.dict(os.environ, {"PATROL_BATTERY_FILE": str(battery)}), patch.object(
+                patrol, "make_transport", FakeTransport
+            ), contextlib.redirect_stdout(io.StringIO()):
+                patrol.run_patrol(
+                    [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+                    (0.0, 0.0),
+                    30.0,
+                    0.0,
+                    status_path,
+                    None,
+                    control,
+                    False,
+                )
+            goals = list(FakeTransport.goals)
+            status = json.loads(status_path.read_text())
+        self.assertEqual(goals, [(0.0, 0.0), (0.0, 0.0)])
+        self.assertIn("5%", status["message"])
 
 
 if __name__ == "__main__":

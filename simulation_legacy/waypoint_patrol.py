@@ -123,6 +123,55 @@ def map_point_to_world(
     )
 
 
+_task_seq = 0
+
+
+def battery_soc() -> int | None:
+    path = os.environ.get("PATROL_BATTERY_FILE", "").strip()
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        soc = int(data["soc"])
+        age = time.time() - float(data.get("t", 0.0))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    if age > 30 or not 0 <= soc <= 100:
+        return None
+    return soc
+
+
+def battery_low() -> bool:
+    soc = battery_soc()
+    return soc is not None and soc < 5
+
+
+def fire_state(control_file: Path | None) -> str:
+    return str(read_control(control_file).get("fire_state", "NaN"))
+
+
+def log_task(event: str, **fields: object) -> None:
+    """One JSON line per patrol event, in the task file named by PATROL_TASK_LOG."""
+    global _task_seq
+    raw = os.environ.get("PATROL_TASK_LOG", "").strip()
+    if not raw:
+        return
+    _task_seq += 1
+    record = {
+        "seq": _task_seq,
+        "t": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **fields,
+    }
+    path = Path(raw)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        return
+
+
 def read_control(control_file: Path | None) -> dict[str, object]:
     if control_file is None:
         return {}
@@ -244,7 +293,9 @@ def run_patrol(
                 y=y,
                 message="Fire alarm active; waiting for Safe confirmation before navigation",
             )
-            if stop_requested() or duration_expired():
+            if battery_low():
+                return "battery"
+            if stop_requested():
                 return "stop"
             time.sleep(0.1)
         goal_reached.clear()
@@ -289,12 +340,16 @@ def run_patrol(
                         y=y,
                         message="Patrol paused for fire alarm; waiting for operator confirmation",
                     )
-                if stop_requested() or duration_expired():
+                if battery_low():
+                    return "battery"
+                if stop_requested():
                     return "stop"
                 time.sleep(0.1)
                 continue
             if paused:
-                if stop_requested() or duration_expired():
+                if battery_low():
+                    return "battery"
+                if stop_requested():
                     return "stop"
                 paused = False
                 goal_reached.clear()
@@ -339,7 +394,10 @@ def run_patrol(
             if read_control(control_file).get("halt"):
                 stop_movement.broadcast(None, Bool(data=True))
                 return "stop"
-            if allow_pause and (stop_requested() or duration_expired()):
+            if allow_pause and battery_low():
+                stop_movement.broadcast(None, Bool(data=True))
+                return "battery"
+            if allow_pause and stop_requested():
                 stop_movement.broadcast(None, Bool(data=True))
                 return "stop"
             if not paused and time.monotonic() >= goal_deadline:
@@ -357,7 +415,7 @@ def run_patrol(
         remaining = seconds
         paused = False
         while remaining > 0:
-            if stop_requested() or duration_expired():
+            if battery_low() or stop_requested():
                 return False
             if read_control(control_file).get("paused"):
                 if not paused:
@@ -412,6 +470,14 @@ def run_patrol(
                 )
                 time.sleep(0.1)
             home_x, home_y = return_to_start
+            log_task(
+                "return_home",
+                reason=stop_reason,
+                x=home_x,
+                y=home_y,
+                fire=fire_state(control_file),
+                soc=battery_soc(),
+            )
             write_status(
                 status_file,
                 phase="returning",
@@ -435,15 +501,34 @@ def run_patrol(
                 stop_reason = "error"
 
         final_message = (
-            "Patrol stopped and robot returned home"
+            "电量低于 5%，已回到出发返回点"
+            if stop_reason == "battery" and home_reached
+            else "电量低于 5%，返航未完成"
+            if stop_reason == "battery"
+            else "Patrol stopped and robot returned home"
             if stop_reason == "stopped" and home_reached
-            else "Patrol duration ended and robot returned home"
+            else "任务时长已到，本圈走完并已回到出发返回点"
             if stop_reason == "duration" and home_reached
             else "Patrol completed and robot returned home"
             if stop_reason == "completed" and home_reached
             else failure or ("Patrol completed at the final waypoint" if stop_reason == "completed" else "Patrol ended")
         )
-        phase = "error" if stop_reason == "error" else "completed" if stop_reason in ("completed", "duration") else "stopped"
+        phase = (
+            "error"
+            if stop_reason == "error"
+            else "completed"
+            if stop_reason in ("completed", "duration", "battery")
+            else "stopped"
+        )
+        log_task(
+            "finished",
+            reason=stop_reason,
+            phase=phase,
+            home_reached=home_reached,
+            fire=fire_state(control_file),
+            soc=battery_soc(),
+            message=final_message,
+        )
         write_status(status_file, phase=phase, cycle=cycle, index=len(waypoints), total=len(waypoints), message=final_message)
         print(final_message, flush=True)
 
@@ -496,6 +581,8 @@ def run_patrol(
                     total=len(waypoints),
                     message="At route departure point; beginning patrol",
                 )
+            elif result == "battery":
+                stop_reason = "battery"
             elif result == "timeout":
                 failure = "Could not reach route departure point"
                 stop_reason = "error"
@@ -507,6 +594,10 @@ def run_patrol(
                 break
             if stop_requested():
                 stop_reason = "stopped"
+                break
+            if battery_low():
+                stop_reason = "battery"
+                log_task("battery_return", fire=fire_state(control_file), soc=battery_soc(), message="电量低于 5%，立即返回出发返回点")
                 break
             if duration_expired():
                 stop_reason = "duration"
@@ -520,16 +611,62 @@ def run_patrol(
                 total=len(waypoints),
                 message="Starting patrol cycle",
             )
+            finishing_round = False
             for i, (x, y, dwell_s) in enumerate(waypoints, start=1):
                 if stop_requested():
                     stop_reason = "stopped"
                     break
-                if duration_expired():
-                    stop_reason = "duration"
+                if battery_low():
+                    stop_reason = "battery"
+                    log_task(
+                        "battery_return",
+                        cycle=cycle,
+                        waypoint_id=i,
+                        x=x,
+                        y=y,
+                        fire=fire_state(control_file),
+                        soc=battery_soc(),
+                        message="电量低于 5%，立即返回出发返回点",
+                    )
                     break
+                if duration_expired() and not finishing_round:
+                    finishing_round = True
+                    log_task(
+                        "duration_finish_round",
+                        cycle=cycle,
+                        waypoint_id=i,
+                        x=x,
+                        y=y,
+                        fire=fire_state(control_file),
+                        soc=battery_soc(),
+                        message="任务时长已到，先走完本圈剩余巡检点，再回出发返回点",
+                    )
+                    write_status(
+                        status_file,
+                        phase="navigating",
+                        cycle=cycle,
+                        index=i,
+                        total=len(waypoints),
+                        x=x,
+                        y=y,
+                        message="任务时长已到，先走完本圈剩余巡检点，再回出发返回点",
+                    )
+                log_task(
+                    "navigate",
+                    cycle=cycle,
+                    waypoint_id=i,
+                    x=x,
+                    y=y,
+                    dwell_s=dwell_s,
+                    fire=fire_state(control_file),
+                    soc=battery_soc(),
+                )
                 result = navigate(x, y, "navigating", cycle, i, len(waypoints))
+                if result == "battery":
+                    stop_reason = "battery"
+                    break
                 if result == "stop":
-                    stop_reason = "stopped" if stop_requested() else "duration"
+                    stop_reason = "stopped"
                     break
                 if result == "timeout":
                     print(f"[cycle {cycle}] [{i}/{len(waypoints)}] skipped map=({x}, {y}): no path within {GOAL_TIMEOUT_S:g}s", flush=True)
@@ -560,8 +697,18 @@ def run_patrol(
                     message=f"Reached point {i}; inspection dwell",
                 )
                 print(f"  reached ({x}, {y}); dwell {dwell_s:g}s", flush=True)
+                log_task(
+                    "reached",
+                    cycle=cycle,
+                    waypoint_id=i,
+                    x=x,
+                    y=y,
+                    dwell_s=dwell_s,
+                    fire=fire_state(control_file),
+                    soc=battery_soc(),
+                )
                 if dwell_s > 0 and not wait_dwell(dwell_s, cycle, i):
-                    stop_reason = "stopped" if stop_requested() else "duration"
+                    stop_reason = "battery" if battery_low() else "stopped"
                     break
 
             if stop_reason != "completed":

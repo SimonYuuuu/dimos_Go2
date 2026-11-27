@@ -93,12 +93,16 @@ cmd_set_epoch() {
     run_root set-epoch "$epoch"
     return
   fi
+  # Wall clock in the same zone as the operator laptop, so `date` matches the console.
+  if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl set-timezone Asia/Shanghai || true
+  fi
   # Avoid tiny adjustments that fight NTP; only correct large skew.
   local now skew
   now="$(date -u +%s)"
   skew=$((epoch - now))
   if [[ ${skew#-} -lt 2 ]]; then
-    echo "Clock already within 2s of target (skew=${skew}s); skipping."
+    echo "Clock already within 2s of target (skew=${skew}s); timezone aligned."
     return 0
   fi
   # Disable NTP briefly so set-time sticks, then re-enable for future boots.
@@ -119,6 +123,9 @@ cmd_boot() {
   if [[ "$(id -u)" -ne 0 ]]; then
     run_root boot
     return
+  fi
+  if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl set-timezone Asia/Shanghai || true
   fi
   cmd_sync_ntp || true
 }

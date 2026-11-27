@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -26,6 +27,7 @@ ROBOT_RERUN_WEB_ORIGIN = os.environ.get("ROBOT_RERUN_WEB_ORIGIN", "http://127.0.
 ROUTES = PROJECT / "remote_client" / "routes"
 DATA = PROJECT / "remote_client" / "data"
 LOGS = PROJECT / "logs"
+LAST_INITIAL_POSE = DATA / "last-initial-pose.json"
 PAGE = PROJECT / "remote_client" / "console.html"
 MAPPING_PAGE = PROJECT / "remote_client" / "mapping.html"
 CURSOR_FILE = DATA / "event-cursor.json"
@@ -360,17 +362,27 @@ def health():
 
 
 _last_clock_push = 0.0
+_task_cursor = {"name": None, "seq": 0}
 
 
 @app.get("/api/status")
 def status():
     global last_status_log, _last_clock_push
     _start_sync_thread()
-    result, code = _agent("status")
+    query = "status"
+    if _task_cursor["name"]:
+        query += (
+            f"?task_after={_task_cursor['seq']}&task_name="
+            + urllib.parse.quote(_task_cursor["name"])
+        )
+    else:
+        query += "?task_after=0"
+    result, code = _agent(query)
     if code != 200:
         return jsonify(error=result.get("error", "Robot agent unavailable."), robot_agent_url=ROBOT_URL), code
     now = time.time()
-    # If Orin clock is skewed, push host UTC (throttled). Needs orin_timesync install.
+    # Push host UTC when the board clock disagrees. Needs the one-time sudo install
+    # of scripts/orin_timesync.sh on Orin; until then the error is returned to the page.
     clock = result.get("clock") if isinstance(result, dict) else None
     if isinstance(clock, dict) and now - _last_clock_push >= 60:
         try:
@@ -378,7 +390,8 @@ def status():
         except (TypeError, ValueError):
             orin_epoch = 0
         skew = abs(int(now) - orin_epoch)
-        if orin_epoch and skew >= 120:
+        zone_off = clock.get("timezone") not in (None, "", "Asia/Shanghai")
+        if orin_epoch and (skew >= 5 or zone_off):
             sync_result, sync_code = _agent("time/sync", "POST", {"epoch": int(now)}, timeout=20.0)
             result["clock_sync"] = {"attempted": True, "code": sync_code, "result": sync_result}
             _last_clock_push = now
@@ -387,7 +400,59 @@ def status():
         last_status_log = now
     result.setdefault("mapping", {}).setdefault("log", [])
     result.setdefault("patrol", {}).setdefault("log", [])
+    _archive_task_log(result.get("patrol") if isinstance(result, dict) else None)
+    # A long outage can leave more events than one response carries. Pull the rest
+    # before answering the page, so the on-screen log is the latest part of the run.
+    for _ in range(5):
+        patrol = result.get("patrol") if isinstance(result, dict) else None
+        if not isinstance(patrol, dict) or not patrol.get("task_log_more") or not _task_cursor["name"]:
+            break
+        more, more_code = _agent(
+            "status?task_after="
+            + str(_task_cursor["seq"])
+            + "&task_name="
+            + urllib.parse.quote(_task_cursor["name"])
+        )
+        if more_code != 200 or not isinstance(more, dict):
+            break
+        _archive_task_log(more.get("patrol"))
+        if isinstance(more.get("patrol"), dict):
+            result["patrol"] = more["patrol"]
     return jsonify(result)
+
+
+def _archive_task_log(patrol: object) -> None:
+    """Copy new patrol task events into logs/<task>.jsonl on this computer."""
+    if not isinstance(patrol, dict):
+        return
+    name = patrol.get("task_log_name")
+    events = patrol.get("task_log")
+    if not isinstance(name, str) or not re.fullmatch(r"patrol-[A-Za-z0-9._-]+\.jsonl", name):
+        return
+    if not isinstance(events, list):
+        return
+    path = LOGS / name
+    last = -1
+    if path.is_file():
+        try:
+            tail = path.read_text(encoding="utf-8").splitlines()[-1]
+            last = int(json.loads(tail).get("seq", -1))
+        except (OSError, json.JSONDecodeError, ValueError, IndexError, AttributeError):
+            last = -1
+    fresh = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        try:
+            seq = int(item.get("seq", -1))
+        except (TypeError, ValueError):
+            continue
+        if seq > last:
+            fresh.append(item)
+            last = seq
+    _append_jsonl(path, fresh)
+    _task_cursor["name"] = name
+    _task_cursor["seq"] = last
 
 
 @app.get("/api/maps")
@@ -412,7 +477,9 @@ def map_points():
 @app.get("/api/routes")
 def list_routes():
     ROUTES.mkdir(parents=True, exist_ok=True)
-    return jsonify(sorted(path.name for path in ROUTES.glob("*.json")))
+    # Newest first: the console preselects the first entry.
+    found = sorted(ROUTES.glob("*.json"), key=lambda path: (-path.stat().st_mtime, path.name))
+    return jsonify([path.name for path in found])
 
 
 @app.get("/api/route")
@@ -559,6 +626,50 @@ def resume_patrol():
     return jsonify(result), code
 
 
+def _saved_initial_pose() -> str | None:
+    try:
+        payload = json.loads(LAST_INITIAL_POSE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    pose = payload.get("initial_pose") if isinstance(payload, dict) else None
+    if not isinstance(pose, str):
+        return None
+    parts = pose.split(",")
+    if len(parts) != 3:
+        return None
+    try:
+        if not all(math.isfinite(float(part)) for part in parts):
+            return None
+    except ValueError:
+        return None
+    return pose
+
+
+def _store_initial_pose(pose: object) -> None:
+    if not isinstance(pose, str):
+        return
+    parts = pose.split(",")
+    if len(parts) != 3:
+        return
+    try:
+        if not all(math.isfinite(float(part)) for part in parts):
+            return
+    except ValueError:
+        return
+    LAST_INITIAL_POSE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LAST_INITIAL_POSE.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"initial_pose": pose, "saved_at": time.time()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(LAST_INITIAL_POSE)
+
+
+@app.get("/api/initial-pose")
+def initial_pose():
+    return jsonify(initial_pose=_saved_initial_pose())
+
+
 @app.post("/api/patrol/confirm-pose")
 def confirm_pose():
     body = request.get_json(silent=True) or {}
@@ -567,6 +678,8 @@ def confirm_pose():
         "speed_mps": body.get("speed_mps", 0),
     }
     result, code = _agent("patrol/confirm-pose", "POST", payload)
+    if code == 200 and isinstance(result, dict):
+        _store_initial_pose(result.get("initial_pose"))
     return jsonify(result), code
 
 
